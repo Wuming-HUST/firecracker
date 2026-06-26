@@ -52,6 +52,7 @@ pub const STATS_INDEX: usize = 2;
 // The feature bitmap for virtio balloon.
 const VIRTIO_BALLOON_F_STATS_VQ: u32 = 1; // Enable statistics.
 const VIRTIO_BALLOON_F_DEFLATE_ON_OOM: u32 = 2; // Deflate balloon on OOM.
+const VIRTIO_BALLOON_F_FREE_PAGE_REPORTING: u32 = 5; // Enable free page reporting.
 
 // The statistics tags.
 const VIRTIO_BALLOON_S_SWAP_IN: u16 = 0;

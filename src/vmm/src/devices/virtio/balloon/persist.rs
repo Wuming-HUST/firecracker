@@ -120,12 +120,19 @@ impl Persist<'_> for Balloon {
         constructor_args: Self::ConstructorArgs,
         state: &Self::State,
     ) -> Result<Self, Self::Error> {
+        // Whether free page reporting was enabled is encoded in the saved
+        // available features. We need it to reconstruct the queue layout.
+        let free_page_reporting = state.virtio_state.avail_features
+            & (1u64 << VIRTIO_BALLOON_F_FREE_PAGE_REPORTING)
+            != 0;
+
         // We can safely create the balloon with arbitrary flags and
         // num_pages because we will overwrite them after.
         let mut balloon = Balloon::new(
             0,
             false,
             state.stats_polling_interval_s,
+            free_page_reporting,
             constructor_args.restored_from_file,
         )?;
 
@@ -134,6 +141,10 @@ impl Persist<'_> for Balloon {
         // should not exist if the statistics are not enabled.
         if state.stats_polling_interval_s == 0 {
             num_queues -= 1;
+        }
+        // The free page reporting queue only exists when reporting is enabled.
+        if free_page_reporting {
+            num_queues += 1;
         }
         balloon.queues = state
             .virtio_state
@@ -192,7 +203,7 @@ mod tests {
         let mut mem = vec![0; 4096];
 
         // Create and save the balloon device.
-        let balloon = Balloon::new(0x42, false, 2, false).unwrap();
+        let balloon = Balloon::new(0x42, false, 2, false, false).unwrap();
 
         Snapshot::serialize(&mut mem.as_mut_slice(), &balloon.save()).unwrap();
 

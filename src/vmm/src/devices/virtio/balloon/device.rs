@@ -10,14 +10,14 @@ use timerfd::{ClockId, SetTimeFlags, TimerFd, TimerState};
 use vmm_sys_util::eventfd::EventFd;
 
 use super::super::device::{DeviceState, VirtioDevice};
-use super::super::queue::Queue;
+use super::super::queue::{FIRECRACKER_MAX_QUEUE_SIZE, Queue};
 use super::super::{ActivateError, TYPE_BALLOON};
 use super::metrics::METRICS;
 use super::util::{compact_page_frame_numbers, remove_range};
 use super::{
-    BALLOON_DEV_ID, BALLOON_NUM_QUEUES, BALLOON_QUEUE_SIZES, DEFLATE_INDEX, INFLATE_INDEX,
-    MAX_PAGE_COMPACT_BUFFER, MAX_PAGES_IN_DESC, MIB_TO_4K_PAGES, STATS_INDEX,
-    VIRTIO_BALLOON_F_DEFLATE_ON_OOM, VIRTIO_BALLOON_F_STATS_VQ, VIRTIO_BALLOON_PFN_SHIFT,
+    BALLOON_DEV_ID, BALLOON_NUM_QUEUES, DEFLATE_INDEX, INFLATE_INDEX, MAX_PAGE_COMPACT_BUFFER,
+    MAX_PAGES_IN_DESC, MIB_TO_4K_PAGES, STATS_INDEX, VIRTIO_BALLOON_F_DEFLATE_ON_OOM,
+    VIRTIO_BALLOON_F_FREE_PAGE_REPORTING, VIRTIO_BALLOON_F_STATS_VQ, VIRTIO_BALLOON_PFN_SHIFT,
     VIRTIO_BALLOON_S_AVAIL, VIRTIO_BALLOON_S_CACHES, VIRTIO_BALLOON_S_HTLB_PGALLOC,
     VIRTIO_BALLOON_S_HTLB_PGFAIL, VIRTIO_BALLOON_S_MAJFLT, VIRTIO_BALLOON_S_MEMFREE,
     VIRTIO_BALLOON_S_MEMTOT, VIRTIO_BALLOON_S_MINFLT, VIRTIO_BALLOON_S_SWAP_IN,
@@ -74,6 +74,8 @@ pub struct BalloonConfig {
     pub deflate_on_oom: bool,
     /// Interval of time in seconds at which the balloon statistics are updated.
     pub stats_polling_interval_s: u16,
+    /// Whether or not free page reporting is enabled.
+    pub free_page_reporting: bool,
 }
 
 /// BalloonStats holds statistics returned from the stats_queue.
@@ -159,7 +161,7 @@ pub struct Balloon {
 
     // Transport related fields.
     pub(crate) queues: Vec<Queue>,
-    pub(crate) queue_evts: [EventFd; BALLOON_NUM_QUEUES],
+    pub(crate) queue_evts: Vec<EventFd>,
     pub(crate) device_state: DeviceState,
     pub(crate) irq_trigger: IrqTrigger,
 
@@ -204,6 +206,7 @@ impl Balloon {
         amount_mib: u32,
         deflate_on_oom: bool,
         stats_polling_interval_s: u16,
+        free_page_reporting: bool,
         restored_from_file: bool,
     ) -> Result<Balloon, BalloonError> {
         let mut avail_features = 1u64 << VIRTIO_F_VERSION_1;
@@ -216,19 +219,30 @@ impl Balloon {
             avail_features |= 1u64 << VIRTIO_BALLOON_F_STATS_VQ;
         }
 
-        let queue_evts = [
-            EventFd::new(libc::EFD_NONBLOCK).map_err(BalloonError::EventFd)?,
-            EventFd::new(libc::EFD_NONBLOCK).map_err(BalloonError::EventFd)?,
-            EventFd::new(libc::EFD_NONBLOCK).map_err(BalloonError::EventFd)?,
-        ];
-
-        let mut queues: Vec<Queue> = BALLOON_QUEUE_SIZES.iter().map(|&s| Queue::new(s)).collect();
-
-        // The VirtIO specification states that the statistics queue should
-        // not be present at all if the statistics are not enabled.
-        if stats_polling_interval_s == 0 {
-            let _ = queues.remove(STATS_INDEX);
+        if free_page_reporting {
+            avail_features |= 1u64 << VIRTIO_BALLOON_F_FREE_PAGE_REPORTING;
         }
+
+        // Compute the number of virt queues. The inflate and deflate queues are
+        // always present. The VirtIO specification states that the statistics
+        // queue should not be present at all if the statistics are not enabled.
+        // The free page reporting queue is only present when reporting is
+        // enabled. They are kept in this order so the queue indices stay
+        // contiguous, as required by the VirtIO specification.
+        let mut num_queues = BALLOON_NUM_QUEUES;
+        if stats_polling_interval_s == 0 {
+            num_queues -= 1;
+        }
+        if free_page_reporting {
+            num_queues += 1;
+        }
+
+        let queues: Vec<Queue> = (0..num_queues)
+            .map(|_| Queue::new(FIRECRACKER_MAX_QUEUE_SIZE))
+            .collect();
+        let queue_evts = (0..num_queues)
+            .map(|_| EventFd::new(libc::EFD_NONBLOCK).map_err(BalloonError::EventFd))
+            .collect::<Result<Vec<_>, _>>()?;
 
         let stats_timer =
             TimerFd::new_custom(ClockId::Monotonic, true, true).map_err(BalloonError::Timer)?;
@@ -278,6 +292,56 @@ impl Balloon {
     pub(crate) fn process_stats_timer_event(&mut self) -> Result<(), BalloonError> {
         self.stats_timer.read();
         self.trigger_stats_update()
+    }
+
+    pub(crate) fn process_free_page_reporting_queue_event(&mut self) -> Result<(), BalloonError> {
+        let idx = self.free_page_reporting_idx();
+        self.queue_evts[idx].read().map_err(BalloonError::EventFd)?;
+        self.process_free_page_reporting_queue()
+    }
+
+    pub(crate) fn process_free_page_reporting_queue(&mut self) -> Result<(), BalloonError> {
+        let idx = self.free_page_reporting_idx();
+        // The driver reports ranges of free pages. For each reported range we
+        // `MADV_DONTNEED` (or punch a hole when restored from a snapshot file)
+        // the underlying host memory, which reduces the RSS of the VM.
+        let mem = self
+            .device_state
+            .mem()
+            .ok_or(BalloonError::DeviceNotActive)?;
+        let restored_from_file = self.restored_from_file;
+        let queue = &mut self.queues[idx];
+        let mut needs_interrupt = false;
+
+        while let Some(head) = queue.pop() {
+            let head_index = head.index;
+
+            let mut last_desc = Some(head);
+            while let Some(desc) = last_desc {
+                METRICS.free_page_report_count.inc();
+                if let Err(err) =
+                    remove_range(mem, (desc.addr, u64::from(desc.len)), restored_from_file)
+                {
+                    METRICS.free_page_report_fails.inc();
+                    error!("balloon: failed to remove range: {:?}", err);
+                } else {
+                    METRICS.free_page_report_freed.add(u64::from(desc.len));
+                }
+                last_desc = desc.next_descriptor();
+            }
+
+            queue
+                .add_used(head_index, 0)
+                .map_err(BalloonError::Queue)?;
+            needs_interrupt = true;
+        }
+        queue.advance_used_ring_idx();
+
+        if needs_interrupt {
+            self.signal_used_queue()?;
+        }
+
+        Ok(())
     }
 
     pub(crate) fn process_inflate(&mut self) -> Result<(), BalloonError> {
@@ -438,6 +502,26 @@ impl Balloon {
     pub fn process_virtio_queues(&mut self) {
         let _ = self.process_inflate();
         let _ = self.process_deflate_queue();
+        if self.free_page_reporting() {
+            let _ = self.process_free_page_reporting_queue();
+        }
+    }
+
+    /// Returns whether free page reporting is enabled for this device.
+    pub fn free_page_reporting(&self) -> bool {
+        self.avail_features & (1u64 << VIRTIO_BALLOON_F_FREE_PAGE_REPORTING) != 0
+    }
+
+    /// Returns the index of the free page reporting queue in the queues/queue_evts
+    /// vectors. The reporting queue is always the last one, placed after the
+    /// (optional) statistics queue.
+    pub fn free_page_reporting_idx(&self) -> usize {
+        // inflate + deflate are always present.
+        let mut idx = BALLOON_NUM_QUEUES - 1;
+        if self.stats_enabled() {
+            idx += 1;
+        }
+        idx
     }
 
     /// Provides the ID of this balloon device.
@@ -535,6 +619,7 @@ impl Balloon {
             amount_mib: self.size_mb(),
             deflate_on_oom: self.deflate_on_oom(),
             stats_polling_interval_s: self.stats_polling_interval_s(),
+            free_page_reporting: self.free_page_reporting(),
         }
     }
 
@@ -727,7 +812,7 @@ pub(crate) mod tests {
         // Test all feature combinations.
         for deflate_on_oom in [true, false].iter() {
             for stats_interval in [0, 1].iter() {
-                let mut balloon = Balloon::new(0, *deflate_on_oom, *stats_interval, false).unwrap();
+                let mut balloon = Balloon::new(0, *deflate_on_oom, *stats_interval, false, false).unwrap();
                 assert_eq!(balloon.device_type(), TYPE_BALLOON);
 
                 let features: u64 = (1u64 << VIRTIO_F_VERSION_1)
@@ -754,12 +839,13 @@ pub(crate) mod tests {
 
     #[test]
     fn test_virtio_read_config() {
-        let balloon = Balloon::new(0x10, true, 0, false).unwrap();
+        let balloon = Balloon::new(0x10, true, 0, false, false).unwrap();
 
         let cfg = BalloonConfig {
             amount_mib: 16,
             deflate_on_oom: true,
             stats_polling_interval_s: 0,
+            free_page_reporting: false,
         };
         assert_eq!(balloon.config(), cfg);
 
@@ -788,7 +874,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_virtio_write_config() {
-        let mut balloon = Balloon::new(0, true, 0, false).unwrap();
+        let mut balloon = Balloon::new(0, true, 0, false, false).unwrap();
 
         let expected_config_space: [u8; BALLOON_CONFIG_SPACE_SIZE] =
             [0x00, 0x50, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
@@ -814,7 +900,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_invalid_request() {
-        let mut balloon = Balloon::new(0, true, 0, false).unwrap();
+        let mut balloon = Balloon::new(0, true, 0, false, false).unwrap();
         let mem = default_mem();
         // Only initialize the inflate queue to demonstrate invalid request handling.
         let infq = VirtQueue::new(GuestAddress(0), &mem, 16);
@@ -873,7 +959,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_inflate() {
-        let mut balloon = Balloon::new(0, true, 0, false).unwrap();
+        let mut balloon = Balloon::new(0, true, 0, false, false).unwrap();
         let mem = default_mem();
         let infq = VirtQueue::new(GuestAddress(0), &mem, 16);
         balloon.set_queue(INFLATE_INDEX, infq.create_queue());
@@ -943,7 +1029,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_deflate() {
-        let mut balloon = Balloon::new(0, true, 0, false).unwrap();
+        let mut balloon = Balloon::new(0, true, 0, false, false).unwrap();
         let mem = default_mem();
         let defq = VirtQueue::new(GuestAddress(0), &mem, 16);
         balloon.set_queue(DEFLATE_INDEX, defq.create_queue());
@@ -991,7 +1077,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_stats() {
-        let mut balloon = Balloon::new(0, true, 1, false).unwrap();
+        let mut balloon = Balloon::new(0, true, 1, false, false).unwrap();
         let mem = default_mem();
         let statsq = VirtQueue::new(GuestAddress(0), &mem, 16);
         balloon.set_queue(STATS_INDEX, statsq.create_queue());
@@ -1077,8 +1163,97 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_free_page_reporting_layout() {
+        // Reporting disabled: feature bit is unset and no extra queue exists.
+        let balloon = Balloon::new(0, true, 0, false, false).unwrap();
+        assert!(!balloon.free_page_reporting());
+        assert_eq!(balloon.queues.len(), 2);
+        assert_eq!(balloon.queue_evts.len(), 2);
+
+        // Reporting enabled, stats disabled: reporting queue sits right after
+        // inflate/deflate, at index 2.
+        let balloon = Balloon::new(0, true, 0, true, false).unwrap();
+        assert!(balloon.free_page_reporting());
+        assert_eq!(balloon.free_page_reporting_idx(), 2);
+        assert_eq!(balloon.queues.len(), 3);
+        assert_eq!(balloon.queue_evts.len(), 3);
+
+        // Reporting enabled, stats enabled: the stats queue takes index 2, so
+        // reporting moves to index 3.
+        let balloon = Balloon::new(0, true, 1, true, false).unwrap();
+        assert!(balloon.free_page_reporting());
+        assert_eq!(balloon.free_page_reporting_idx(), 3);
+        assert_eq!(balloon.queues.len(), 4);
+        assert_eq!(balloon.queue_evts.len(), 4);
+    }
+
+    #[test]
+    fn test_process_reporting() {
+        // Enable free page reporting (stats disabled), so the reporting queue
+        // is at index 2.
+        let mut balloon = Balloon::new(0, true, 0, true, false).unwrap();
+        let reporting_idx = balloon.free_page_reporting_idx();
+        assert_eq!(reporting_idx, 2);
+
+        let mem = default_mem();
+        let repq = VirtQueue::new(GuestAddress(0), &mem, 16);
+        balloon.set_queue(reporting_idx, repq.create_queue());
+        balloon.activate(mem.clone()).unwrap();
+
+        // Fill the second (page-aligned) page with non-zero bytes.
+        let page_size: u64 = 0x1000;
+        let reported_addr = page_size;
+        for i in 0..page_size {
+            mem.write_obj::<u8>(1, GuestAddress(reported_addr + i))
+                .unwrap();
+        }
+
+        // Error case: the request is well-formed, but the reporting event was
+        // not triggered, so reading the (empty) eventfd fails.
+        {
+            // The guest reports a single, page-aligned range of free pages. No
+            // VIRTQ_DESC_F_NEXT flag, so the chain has a single descriptor.
+            set_request(&repq, 0, reported_addr, page_size as u32, 0);
+
+            check_metric_after_block!(
+                METRICS.event_fails,
+                1,
+                balloon
+                    .process_free_page_reporting_queue_event()
+                    .unwrap_or_else(report_balloon_event_fail)
+            );
+            // Nothing got processed.
+            assert_eq!(repq.used.idx.get(), 0);
+            // The page is untouched.
+            for i in 0..page_size {
+                assert_eq!(mem.read_obj::<u8>(GuestAddress(reported_addr + i)).unwrap(), 1);
+            }
+        }
+
+        // Happy case: trigger the eventfd and process the report. The reported
+        // range is MADV_DONTNEED'd, which zeroes the anonymous backing pages.
+        {
+            set_request(&repq, 0, reported_addr, page_size as u32, 0);
+
+            check_metric_after_block!(METRICS.free_page_report_freed, page_size, {
+                balloon.queue_evts[reporting_idx].write(1).unwrap();
+                balloon.process_free_page_reporting_queue_event().unwrap();
+            });
+
+            // The descriptor was returned to the guest and an interrupt raised.
+            check_request_completion(&repq, 0);
+            assert!(balloon.irq_trigger.has_pending_irq(IrqType::Vring));
+
+            // The reported page has been released (zeroed).
+            for i in 0..page_size {
+                assert_eq!(mem.read_obj::<u8>(GuestAddress(reported_addr + i)).unwrap(), 0);
+            }
+        }
+    }
+
+    #[test]
     fn test_process_balloon_queues() {
-        let mut balloon = Balloon::new(0x10, true, 0, false).unwrap();
+        let mut balloon = Balloon::new(0x10, true, 0, false, false).unwrap();
         let mem = default_mem();
         let infq = VirtQueue::new(GuestAddress(0), &mem, 16);
         let defq = VirtQueue::new(GuestAddress(0), &mem, 16);
@@ -1092,7 +1267,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_update_stats_interval() {
-        let mut balloon = Balloon::new(0, true, 0, false).unwrap();
+        let mut balloon = Balloon::new(0, true, 0, false, false).unwrap();
         let mem = default_mem();
         balloon.activate(mem).unwrap();
         assert_eq!(
@@ -1101,7 +1276,7 @@ pub(crate) mod tests {
         );
         balloon.update_stats_polling_interval(0).unwrap();
 
-        let mut balloon = Balloon::new(0, true, 1, false).unwrap();
+        let mut balloon = Balloon::new(0, true, 1, false, false).unwrap();
         let mem = default_mem();
         balloon.activate(mem).unwrap();
         assert_eq!(
@@ -1114,14 +1289,14 @@ pub(crate) mod tests {
 
     #[test]
     fn test_cannot_update_inactive_device() {
-        let mut balloon = Balloon::new(0, true, 0, false).unwrap();
+        let mut balloon = Balloon::new(0, true, 0, false, false).unwrap();
         // Assert that we can't update an inactive device.
         balloon.update_size(1).unwrap_err();
     }
 
     #[test]
     fn test_num_pages() {
-        let mut balloon = Balloon::new(0, true, 0, false).unwrap();
+        let mut balloon = Balloon::new(0, true, 0, false, false).unwrap();
         // Switch the state to active.
         balloon.device_state = DeviceState::Activated(single_region_mem(0x1));
 
