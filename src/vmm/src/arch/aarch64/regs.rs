@@ -87,6 +87,8 @@ arm64_sys_reg!(MIDR_EL1, 3, 0, 0, 0, 0);
 arm64_sys_reg!(ID_AA64PFR0_EL1, 3, 0, 0, 4, 0);
 arm64_sys_reg!(ID_AA64ISAR0_EL1, 3, 0, 0, 6, 0);
 arm64_sys_reg!(ID_AA64ISAR1_EL1, 3, 0, 0, 6, 1);
+arm64_sys_reg!(ID_AA64MMFR1_EL1, 3, 0, 0, 7, 1);
+arm64_sys_reg!(TCR2_EL1, 3, 0, 2, 0, 3);
 arm64_sys_reg!(ID_AA64MMFR2_EL1, 3, 0, 0, 7, 2);
 
 // Counter-timer Virtual Timer CompareValue register.

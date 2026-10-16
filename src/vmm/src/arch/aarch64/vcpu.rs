@@ -84,9 +84,15 @@ pub fn get_registers(
     Ok(())
 }
 
+/// Required guest HAFT policy, set before the VMM threads start.
+pub static REQUIRE_GUEST_HAFT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Errors associated with the wrappers over KVM ioctls.
 #[derive(Debug, PartialEq, Eq, thiserror::Error, displaydoc::Display)]
 pub enum KvmVcpuError {
+    /// Required guest HAFT is unavailable: {0}
+    RequiredHaft(String),
     /// Error configuring the vcpu registers: {0}
     ConfigureRegisters(VcpuArchError),
     /// Error creating vcpu: {0}
@@ -185,6 +191,8 @@ impl KvmVcpu {
             })?;
         }
 
+        self.verify_required_haft(false)?;
+
         self.setup_boot_regs(
             kernel_entry_point.entry_addr.raw_value(),
             guest_mem,
@@ -273,8 +281,40 @@ impl KvmVcpu {
         {
             self.set_register(reg).map_err(KvmVcpuError::RestoreState)?;
         }
+        self.verify_required_haft(true)?;
         self.set_mpstate(state.mp_state)
             .map_err(KvmVcpuError::RestoreState)?;
+        Ok(())
+    }
+
+    /// Check the KVM guest view, never forge a feature the host does not expose.
+    fn verify_required_haft(&self, restored: bool) -> Result<(), KvmVcpuError> {
+        if !REQUIRE_GUEST_HAFT.load(std::sync::atomic::Ordering::Relaxed) {
+            return Ok(());
+        }
+        self.verify_haft(restored)
+    }
+
+    fn verify_haft(&self, restored: bool) -> Result<(), KvmVcpuError> {
+        let mut bytes = [0u8; 8];
+        self.fd
+            .get_one_reg(super::regs::ID_AA64MMFR1_EL1, &mut bytes)
+            .map_err(|e| KvmVcpuError::RequiredHaft(format!("read guest MMFR1: {e}")))?;
+        let field = u64::from_le_bytes(bytes) & 15;
+        if !matches!(field, 3 | 4) {
+            return Err(KvmVcpuError::RequiredHaft(format!(
+                "guest HAFDBS={field}, require 3 or 4"
+            )));
+        }
+        // Ensure the extra system register is supported by KVM and snapshot machinery.
+        self.fd
+            .get_one_reg(super::regs::TCR2_EL1, &mut bytes)
+            .map_err(|e| KvmVcpuError::RequiredHaft(format!("read guest TCR2: {e}")))?;
+        if restored && u64::from_le_bytes(bytes) & (1 << 11) == 0 {
+            return Err(KvmVcpuError::RequiredHaft(
+                "restored TCR2.HAFT is clear; rebuild template with HAFT guest kernel".into(),
+            ));
+        }
         Ok(())
     }
 
@@ -517,6 +557,18 @@ mod tests {
         let vcpu = KvmVcpu::new(0, &vm).unwrap();
 
         (kvm, vm, vcpu)
+    }
+
+    #[test]
+    #[ignore = "requires KVM guest HAFT and TCR2 support"]
+    fn test_guest_haft_guard() {
+        let (_kvm, _vm, vcpu) = setup_vcpu(0x10000);
+        vcpu.verify_haft(false).unwrap();
+        assert!(vcpu.verify_haft(true).is_err());
+        vcpu.fd
+            .set_one_reg(super::super::regs::TCR2_EL1, &(1u64 << 11).to_le_bytes())
+            .unwrap();
+        vcpu.verify_haft(true).unwrap();
     }
 
     #[test]

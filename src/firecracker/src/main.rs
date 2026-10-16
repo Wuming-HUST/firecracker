@@ -144,6 +144,11 @@ fn main_exec() -> Result<(), MainError> {
     let mut arg_parser =
         ArgParser::new()
             .arg(
+                Argument::new("require-guest-haft")
+                    .takes_value(false)
+                    .help("Require guest HAFT and restore TCR2.HAFT"),
+            )
+            .arg(
                 Argument::new("api-sock")
                     .takes_value(true)
                     .default_value(DEFAULT_API_SOCK_PATH)
@@ -313,6 +318,16 @@ fn main_exec() -> Result<(), MainError> {
         })
         .map_err(MainError::LoggerInitialization)?;
     info!("Running Firecracker v{FIRECRACKER_VERSION}");
+
+    #[cfg(target_arch = "aarch64")]
+    vmm::arch::aarch64::vcpu::REQUIRE_GUEST_HAFT.store(
+        arguments.flag_present("require-guest-haft"),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    #[cfg(not(target_arch = "aarch64"))]
+    if arguments.flag_present("require-guest-haft") {
+        panic!("guest HAFT requires aarch64");
+    }
 
     register_signal_handlers().map_err(MainError::RegisterSignalHandlers)?;
 
