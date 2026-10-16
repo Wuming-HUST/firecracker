@@ -45,6 +45,8 @@ const MMDS_CONTENT_ARG: &str = "metadata";
 
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
 enum MainError {
+    /// Invalid memory tracking configuration: {0}
+    MemoryTracking(String),
     /// Failed to set the logger: {0}
     SetLogger(vmm::logger::LoggerInitError),
     /// Failed to register signal handlers: {0}
@@ -143,6 +145,16 @@ fn main_exec() -> Result<(), MainError> {
 
     let mut arg_parser =
         ArgParser::new()
+            .arg(
+                Argument::new("kvm-dirty-bitmap").takes_value(false).help(
+                    "Export cumulative software KVM dirty bitmap for HDBSS control experiments",
+                ),
+            )
+            .arg(
+                Argument::new("hdbss-order")
+                    .takes_value(true)
+                    .help("openEuler arm64 HDBSS buffer order 1..9; 0 disables"),
+            )
             .arg(
                 Argument::new("api-sock")
                     .takes_value(true)
@@ -313,6 +325,12 @@ fn main_exec() -> Result<(), MainError> {
         })
         .map_err(MainError::LoggerInitialization)?;
     info!("Running Firecracker v{FIRECRACKER_VERSION}");
+
+    vmm::vstate::hdbss::set_order(
+        arguments.single_value("hdbss-order").map(String::as_str),
+        arguments.flag_present("kvm-dirty-bitmap"),
+    )
+    .map_err(|e| MainError::MemoryTracking(e.to_string()))?;
 
     register_signal_handlers().map_err(MainError::RegisterSignalHandlers)?;
 

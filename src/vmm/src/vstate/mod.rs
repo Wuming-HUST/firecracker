@@ -9,3 +9,6 @@ pub mod memory;
 pub mod vcpu;
 /// Module with Vm implementation.
 pub mod vm;
+
+/// Vendor HDBSS initialization and validation.
+pub mod hdbss;

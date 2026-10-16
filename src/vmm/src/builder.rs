@@ -151,6 +151,7 @@ fn create_vmm_and_vcpus(
     let acpi_device_manager = ACPIDeviceManager::new();
 
     let (vcpus, vcpus_exit_evt) = vm.create_vcpus(vcpu_count)?;
+    crate::vstate::hdbss::configure(&kvm, &mut vm)?;
 
     #[cfg(target_arch = "x86_64")]
     let pio_device_manager = {

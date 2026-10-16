@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use kvm_bindings::{KVM_MEM_LOG_DIRTY_PAGES, kvm_userspace_memory_region};
 use kvm_ioctls::VmFd;
@@ -23,7 +23,8 @@ use crate::persist::{CreateSnapshotError, VmInfo};
 use crate::utils::u64_to_usize;
 use crate::vmm_config::snapshot::SnapshotType;
 use crate::vstate::memory::{
-    Address, GuestMemory, GuestMemoryExtension, GuestMemoryMmap, GuestMemoryRegion, GuestRegionMmap,
+    Address, Bitmap, GuestMemory, GuestMemoryExtension, GuestMemoryMmap, GuestMemoryRegion,
+    GuestRegionMmap,
 };
 use crate::vstate::vcpu::VcpuError;
 use crate::{DirtyBitmap, Vcpu, mem_size_mib};
@@ -36,6 +37,11 @@ pub struct VmCommon {
     max_memslots: usize,
     /// The guest memory of this Vm.
     pub guest_memory: GuestMemoryMmap,
+    /// Host-only HDBSS resources are recreated on restore.
+    pub hdbss_order: u32,
+    /// Export cumulative kernel/VMM dirty bits, including software control mode.
+    pub track_dirty_export: bool,
+    hdbss_dirty: Mutex<DirtyBitmap>,
 }
 
 /// Describes the region of guest memory that can be used for creating the memfile.
@@ -59,6 +65,8 @@ pub struct GuestMemoryRegionMapping {
 pub enum VmError {
     /// Cannot set the memory regions: {0}
     SetUserMemoryRegion(kvm_ioctls::Error),
+    /// Failed to collect KVM dirty log: {0}
+    GetDirtyLog(kvm_ioctls::Error),
     /// Failed to create VM: {0}
     CreateVm(kvm_ioctls::Error),
     /// {0}
@@ -119,6 +127,9 @@ impl Vm {
             fd,
             max_memslots: kvm.max_nr_memslots(),
             guest_memory: GuestMemoryMmap::default(),
+            hdbss_order: 0,
+            track_dirty_export: false,
+            hdbss_dirty: Mutex::new(HashMap::new()),
         })
     }
 
@@ -147,6 +158,11 @@ impl Vm {
         &mut self,
         regions: Vec<GuestRegionMmap>,
     ) -> Result<(), VmError> {
+        if self.common.track_dirty_export && regions.iter().any(|r| r.bitmap().is_none()) {
+            return Err(VmError::InvalidMemoryConfiguration(
+                "dirty bitmap export requires track_dirty_pages / enable_diff_snapshots".into(),
+            ));
+        }
         for region in regions {
             self.register_memory_region(region)?
         }
@@ -339,6 +355,30 @@ impl Vm {
 
     /// Retrieves the KVM dirty bitmap for each of the guest's memory regions.
     pub fn get_dirty_bitmap(&self) -> Result<DirtyBitmap, vmm_sys_util::errno::Error> {
+        if self.common.track_dirty_export {
+            // Keep a conservative VM-lifetime ledger: GET_DIRTY_LOG clears KVM bits.
+            // Store each slot immediately so a later slot failure cannot lose prior bits.
+            let mut ledger = self
+                .common
+                .hdbss_dirty
+                .lock()
+                .expect("HDBSS ledger poisoned");
+            for (slot, region) in self.guest_memory().iter().enumerate() {
+                let dirty = self.fd().get_dirty_log(slot as u32, region.size())?;
+                let saved = ledger
+                    .entry(slot as u32)
+                    .or_insert_with(|| vec![0; dirty.len()]);
+                for (dst, src) in saved.iter_mut().zip(dirty) {
+                    *dst |= src;
+                }
+                for page in 0..region.size().div_ceil(host_page_size()) {
+                    if region.bitmap().dirty_at(page * host_page_size()) {
+                        saved[page / 64] |= 1u64 << (page % 64);
+                    }
+                }
+            }
+            return Ok(ledger.clone());
+        }
         let mut bitmap: DirtyBitmap = HashMap::new();
         self.guest_memory()
             .iter()
@@ -408,8 +448,10 @@ impl Vm {
             }
             SnapshotType::Full => {
                 self.guest_memory().dump(&mut file)?;
-                self.reset_dirty_bitmap();
-                self.guest_memory().reset_dirty();
+                if !self.common.track_dirty_export {
+                    self.reset_dirty_bitmap();
+                    self.guest_memory().reset_dirty();
+                }
             }
         };
 
@@ -436,13 +478,8 @@ pub fn mincore_bitmap(addr: *mut u8, len: usize, page_size: usize) -> Result<Vec
     let mut mincore_vec = vec![0u8; mincore_pages];
 
     // SAFETY: addr is valid memory of length `len` owned by the caller
-    let mincore_result = unsafe {
-        libc::mincore(
-            addr.cast::<libc::c_void>(),
-            len,
-            mincore_vec.as_mut_ptr(),
-        )
-    };
+    let mincore_result =
+        unsafe { libc::mincore(addr.cast::<libc::c_void>(), len, mincore_vec.as_mut_ptr()) };
 
     for page_idx in 0..nr_pages {
         let page_offset = page_idx * page_size;

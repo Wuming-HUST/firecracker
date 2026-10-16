@@ -766,24 +766,39 @@ impl Vmm {
     /// A set bit indicates the page is present in RAM and has been written to (not write-protected).
     /// Pages are ordered in the same order as reported by `/memory/mappings`.
     pub fn get_dirty_memory(&self, page_size: usize) -> Result<Vec<u64>, VmmError> {
+        // Include hardware and VMM writes even if pages are swapped out; keep the
+        // existing UFFD-WP/pagemap path for userspace COPY writes and baseline compatibility.
+        let hardware = if self.vm.common.track_dirty_export {
+            if page_size != 4096 {
+                return Err(vstate::vm::VmError::InvalidMemoryConfiguration(
+                    "HDBSS export requires 4KiB pages".into(),
+                )
+                .into());
+            }
+            Some(
+                self.vm
+                    .get_dirty_bitmap()
+                    .map_err(vstate::vm::VmError::GetDirtyLog)?,
+            )
+        } else {
+            None
+        };
         let pagemap = utils::pagemap::PagemapReader::new(page_size)?;
         let mut dirty_bitmap = vec![];
 
-        for region in self.vm.guest_memory().iter() {
+        for (slot, region) in self.vm.guest_memory().iter().enumerate() {
             let base_addr = region.as_ptr() as usize;
             let len = region.size() as usize;
             let nr_pages = len / page_size;
 
             // Use mincore to get resident pages bitmap at guest page size granularity
-            let resident_bitmap =
-                vstate::vm::mincore_bitmap(base_addr as *mut u8, len, page_size)?;
+            let resident_bitmap = vstate::vm::mincore_bitmap(base_addr as *mut u8, len, page_size)?;
 
             // Build dirty bitmap: check pagemap only for pages that mincore reports resident.
             // This reduces the number of /proc/self/pagemap reads.
             let mut slot_bitmap = vec![0u64; nr_pages.div_ceil(64)];
             for page_idx in 0..nr_pages {
-                let is_resident =
-                    (resident_bitmap[page_idx / 64] & (1u64 << (page_idx % 64))) != 0;
+                let is_resident = (resident_bitmap[page_idx / 64] & (1u64 << (page_idx % 64))) != 0;
                 if is_resident {
                     let virt_addr = base_addr + (page_idx * page_size);
                     if pagemap.is_page_dirty(virt_addr)? {
@@ -792,6 +807,13 @@ impl Vmm {
                 }
             }
 
+            if let Some(ref hardware) = hardware {
+                if let Some(bits) = hardware.get(&(slot as u32)) {
+                    for (dst, src) in slot_bitmap.iter_mut().zip(bits) {
+                        *dst |= *src;
+                    }
+                }
+            }
             dirty_bitmap.extend_from_slice(&slot_bitmap);
         }
 
