@@ -8,6 +8,7 @@
 use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::Write;
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -374,6 +375,29 @@ impl Vm {
             .open(mem_file_path)
             .map_err(|err| MemoryBackingFile("open", err))?;
 
+        // A snapshot must never overwrite an inode used as a template, even via
+        // a hardlink alias. Opening without truncation above does not mutate it.
+        let output = file
+            .metadata()
+            .map_err(|e| MemoryBackingFile("stat output", e))?;
+        for region in self.guest_memory().iter() {
+            if let Some(backing) = region.file_offset() {
+                let source = backing
+                    .file()
+                    .metadata()
+                    .map_err(|e| MemoryBackingFile("stat backing", e))?;
+                if output.dev() == source.dev() && output.ino() == source.ino() {
+                    return Err(MemoryBackingFile(
+                        "template overwrite",
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "snapshot output must not alias a mapped template",
+                        ),
+                    ));
+                }
+            }
+        }
+
         // Determine what size our total memory area is.
         let mem_size_mib = mem_size_mib(self.guest_memory());
         let expected_size = mem_size_mib * 1024 * 1024;
@@ -436,13 +460,8 @@ pub fn mincore_bitmap(addr: *mut u8, len: usize, page_size: usize) -> Result<Vec
     let mut mincore_vec = vec![0u8; mincore_pages];
 
     // SAFETY: addr is valid memory of length `len` owned by the caller
-    let mincore_result = unsafe {
-        libc::mincore(
-            addr.cast::<libc::c_void>(),
-            len,
-            mincore_vec.as_mut_ptr(),
-        )
-    };
+    let mincore_result =
+        unsafe { libc::mincore(addr.cast::<libc::c_void>(), len, mincore_vec.as_mut_ptr()) };
 
     for page_idx in 0..nr_pages {
         let page_offset = page_idx * page_size;

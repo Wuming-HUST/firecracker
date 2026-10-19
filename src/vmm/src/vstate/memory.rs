@@ -7,6 +7,8 @@
 
 use std::fs::File;
 use std::io::SeekFrom;
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::MetadataExt;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -48,10 +50,26 @@ pub enum MemoryError {
     MemfdSetLen(std::io::Error),
     /// Total sum of memory regions exceeds largest possible file offset
     OffsetTooLarge,
+    /// Invalid hugepage snapshot backing: {0}
+    HugepageBacking(String),
 }
 
 /// Creates a `Vec` of `GuestRegionMmap` with the given configuration
 pub fn create(
+    regions: impl Iterator<Item = (GuestAddress, usize)>,
+    mmap_flags: libc::c_int,
+    file: Option<File>,
+    track_dirty_pages: bool,
+) -> Result<Vec<GuestRegionMmap>, MemoryError> {
+    create_with_flags(
+        regions,
+        libc::MAP_NORESERVE | mmap_flags,
+        file,
+        track_dirty_pages,
+    )
+}
+
+fn create_with_flags(
     regions: impl Iterator<Item = (GuestAddress, usize)>,
     mmap_flags: libc::c_int,
     file: Option<File>,
@@ -66,7 +84,7 @@ pub fn create(
                 track_dirty_pages.then(|| AtomicBitmap::with_len(size)),
             )
             .with_mmap_prot(libc::PROT_READ | libc::PROT_WRITE)
-            .with_mmap_flags(libc::MAP_NORESERVE | mmap_flags);
+            .with_mmap_flags(mmap_flags);
 
             if let Some(ref file) = file {
                 let file_offset = FileOffset::from_arc(Arc::clone(file), offset);
@@ -130,6 +148,58 @@ pub fn snapshot_file(
     track_dirty_pages: bool,
 ) -> Result<Vec<GuestRegionMmap>, MemoryError> {
     create(regions, libc::MAP_PRIVATE, Some(file), track_dirty_pages)
+}
+
+/// Restore an immutable 2 MiB hugetlbfs template with private COW mappings.
+/// Reservations are enabled: this backend must not inherit MAP_NORESERVE.
+pub fn snapshot_hugetlb_file(
+    file: File,
+    regions: impl Iterator<Item = (GuestAddress, usize)>,
+    track_dirty_pages: bool,
+) -> Result<Vec<GuestRegionMmap>, MemoryError> {
+    let invalid = |message: &str| MemoryError::HugepageBacking(message.to_owned());
+    let mut fs = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: the fd is live and fs points to a sufficiently sized output buffer.
+    if unsafe { libc::fstatfs(file.as_raw_fd(), fs.as_mut_ptr()) } != 0 {
+        return Err(invalid("cannot inspect backing filesystem"));
+    }
+    // SAFETY: successful fstatfs initialized fs.
+    let fs = unsafe { fs.assume_init() };
+    const HUGE_PAGE_SIZE: usize = 2 * 1024 * 1024;
+    if fs.f_type != libc::HUGETLBFS_MAGIC || fs.f_bsize != HUGE_PAGE_SIZE as libc::c_long {
+        return Err(invalid("expected a 2 MiB hugetlbfs file"));
+    }
+    let metadata = file
+        .metadata()
+        .map_err(|_| invalid("cannot stat backing file"))?;
+    if metadata.mode() & 0o222 != 0 {
+        return Err(invalid("template file must be published read-only"));
+    }
+    let regions: Vec<_> = regions.collect();
+    let mut total = 0u64;
+    for (start, size) in &regions {
+        if *size == 0
+            || size % HUGE_PAGE_SIZE != 0
+            || start.raw_value() % HUGE_PAGE_SIZE as u64 != 0
+        {
+            return Err(invalid("guest regions must be 2 MiB aligned"));
+        }
+        total = total
+            .checked_add(*size as u64)
+            .ok_or(MemoryError::OffsetTooLarge)?;
+    }
+    if regions.is_empty() || total != metadata.len() {
+        return Err(invalid(
+            "template size must equal the aligned memory layout",
+        ));
+    }
+    // A hugetlbfs fd selects its hugepage size; do not use anonymous MAP_HUGETLB.
+    create_with_flags(
+        regions.into_iter(),
+        libc::MAP_PRIVATE,
+        Some(file),
+        track_dirty_pages,
+    )
 }
 
 /// Defines the interface for snapshotting memory.
@@ -352,6 +422,18 @@ mod tests {
     use super::*;
     use crate::snapshot::Snapshot;
     use crate::utils::{get_page_size, mib_to_bytes};
+
+    #[test]
+    fn test_hugetlb_snapshot_rejects_regular_file() {
+        let file = vmm_sys_util::tempfile::TempFile::new().unwrap().into_file();
+        file.set_len(2 * 1024 * 1024).unwrap();
+        let result = snapshot_hugetlb_file(
+            file,
+            [(GuestAddress(0), 2 * 1024 * 1024)].into_iter(),
+            false,
+        );
+        assert!(matches!(result, Err(MemoryError::HugepageBacking(_))));
+    }
 
     #[test]
     fn test_anonymous() {
