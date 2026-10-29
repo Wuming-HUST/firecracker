@@ -11,7 +11,7 @@ use std::io::Write;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use kvm_bindings::{KVM_MEM_LOG_DIRTY_PAGES, kvm_userspace_memory_region};
+use kvm_bindings::{kvm_userspace_memory_region, KVM_MEM_LOG_DIRTY_PAGES};
 use kvm_ioctls::VmFd;
 use serde::{Deserialize, Serialize};
 use vmm_sys_util::eventfd::EventFd;
@@ -27,7 +27,7 @@ use crate::vstate::memory::{
     GuestRegionMmap,
 };
 use crate::vstate::vcpu::VcpuError;
-use crate::{DirtyBitmap, Vcpu, mem_size_mib};
+use crate::{mem_size_mib, DirtyBitmap, Vcpu};
 
 /// Architecture independent parts of a VM.
 #[derive(Debug)]
@@ -353,42 +353,65 @@ impl Vm {
             });
     }
 
-    /// Retrieves the KVM dirty bitmap for each of the guest's memory regions.
+    /// Retrieves cumulative KVM and device-model dirty bits without losing a harvest.
     pub fn get_dirty_bitmap(&self) -> Result<DirtyBitmap, vmm_sys_util::errno::Error> {
+        self.get_dirty_bitmap_measured().map(|(bits, _)| bits)
+    }
+
+    /// Same collection, with phase counters used by the local experiment harness.
+    pub fn get_dirty_bitmap_measured(
+        &self,
+    ) -> Result<(DirtyBitmap, crate::utils::dirty_tracking::DirtyStats), vmm_sys_util::errno::Error>
+    {
+        use crate::utils::dirty_tracking::{or_words, DirtyStats};
+        use crate::vstate::hdbss::{self, ExportPolicy};
+        use std::time::Instant;
+        let mut stats = DirtyStats::default();
         if self.common.track_dirty_export {
-            // Keep a conservative VM-lifetime ledger: GET_DIRTY_LOG clears KVM bits.
-            // Store each slot immediately so a later slot failure cannot lose prior bits.
+            // GET_DIRTY_LOG may clear kernel bits. Commit each harvest to the ledger
+            // immediately; a later slot failure must not discard earlier slots.
             let mut ledger = self
                 .common
                 .hdbss_dirty
                 .lock()
-                .expect("HDBSS ledger poisoned");
+                .expect("dirty ledger poisoned");
             for (slot, region) in self.guest_memory().iter().enumerate() {
+                let start = Instant::now();
                 let dirty = self.fd().get_dirty_log(slot as u32, region.size())?;
+                stats.kvm_collect_ns += start.elapsed().as_nanos() as u64;
+                stats.kvm_ioctls += 1;
                 let saved = ledger
                     .entry(slot as u32)
                     .or_insert_with(|| vec![0; dirty.len()]);
-                for (dst, src) in saved.iter_mut().zip(dirty) {
-                    *dst |= src;
-                }
-                for page in 0..region.size().div_ceil(host_page_size()) {
-                    if region.bitmap().dirty_at(page * host_page_size()) {
-                        saved[page / 64] |= 1u64 << (page % 64);
+                or_words(saved, &dirty);
+                let start = Instant::now();
+                if hdbss::export_policy() == ExportPolicy::Hybrid {
+                    for page in 0..region.size().div_ceil(host_page_size()) {
+                        if region.bitmap().dirty_at(page * host_page_size()) {
+                            saved[page / 64] |= 1u64 << (page % 64);
+                        }
                     }
+                } else if let Some(bitmap) = region.bitmap() {
+                    // vm-memory 0.16 has no non-destructive word snapshot API.
+                    // Clone does one Acquire load per word; reset ONLY the clone.
+                    // Never clear the live bitmap or weaken failed-save semantics.
+                    let words = bitmap.clone().get_and_reset();
+                    stats.vmm_words += words.len() as u64;
+                    or_words(saved, &words);
                 }
+                stats.vmm_collect_ns += start.elapsed().as_nanos() as u64;
             }
-            return Ok(ledger.clone());
+            return Ok((ledger.clone(), stats));
         }
         let mut bitmap: DirtyBitmap = HashMap::new();
-        self.guest_memory()
-            .iter()
-            .zip(0u32..)
-            .try_for_each(|(region, slot)| {
+        for (slot, region) in self.guest_memory().iter().enumerate() {
+            bitmap.insert(
+                slot as u32,
                 self.fd()
-                    .get_dirty_log(slot, u64_to_usize(region.len()))
-                    .map(|bitmap_region| _ = bitmap.insert(slot, bitmap_region))
-            })?;
-        Ok(bitmap)
+                    .get_dirty_log(slot as u32, u64_to_usize(region.len()))?,
+            );
+        }
+        Ok((bitmap, stats))
     }
 
     /// Takes a snapshot of the virtual machine running inside the given [`Vmm`] and saves it to
@@ -508,8 +531,8 @@ pub fn mincore_bitmap(addr: *mut u8, len: usize, page_size: usize) -> Result<Vec
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use vm_memory::GuestAddress;
     use vm_memory::mmap::MmapRegionBuilder;
+    use vm_memory::GuestAddress;
 
     use super::*;
     use crate::test_utils::single_region_mem_raw;

@@ -68,6 +68,9 @@ impl VirtioBlock {
 impl MutEventSubscriber for VirtioBlock {
     // Handle an event for queue or rate limiter.
     fn process(&mut self, event: Events, ops: &mut EventOps) {
+        if self.external_snapshot_frozen {
+            return;
+        }
         let source = event.data();
         let event_set = event.event_set();
 
@@ -124,7 +127,7 @@ mod tests {
     };
     use crate::devices::virtio::block::virtio::{VIRTIO_BLK_S_OK, VIRTIO_BLK_T_OUT};
     use crate::devices::virtio::queue::VIRTQ_DESC_F_NEXT;
-    use crate::devices::virtio::test_utils::{VirtQueue, default_mem};
+    use crate::devices::virtio::test_utils::{default_mem, VirtQueue};
     use crate::vstate::memory::{Bytes, GuestAddress};
 
     #[test]
@@ -166,6 +169,12 @@ mod tests {
         // Process the activate event.
         let ev_count = event_manager.run_with_timeout(50).unwrap();
         assert_eq!(ev_count, 1);
+
+        // External snapshot state must remain paired with RAM until export.
+        block.lock().unwrap().external_snapshot_frozen = true;
+        event_manager.run_with_timeout(10).unwrap();
+        assert_eq!(vq.used.idx.get(), 0);
+        block.lock().unwrap().external_snapshot_frozen = false;
 
         // Handle the pending queue event through EventManager.
         event_manager

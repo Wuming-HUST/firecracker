@@ -5,6 +5,50 @@ use crate::vstate::{
     vm::{Vm, VmError},
 };
 
+/// Dirty selection policy. Hybrid preserves the compatibility scan; bitmap
+/// consumes KVM plus VMM writes only. Batched retains scan semantics with fewer syscalls.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExportPolicy {
+    /// Compatibility scan: per-resident-page pagemap reads and per-page VMM merge.
+    Hybrid,
+    /// Sequential 32 KiB pagemap reads and word-based VMM merge.
+    Batched,
+    /// KVM plus VMM bitmaps, without pagemap selection.
+    Bitmap,
+}
+static EXPORT_POLICY: std::sync::OnceLock<ExportPolicy> = std::sync::OnceLock::new();
+static UFFD_WP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Configure opt-in experiment policy before creating a VM.
+pub fn set_export_policy(value: Option<&str>, uffd_wp: bool) -> Result<(), VmError> {
+    let policy = parse_export_policy(value)?;
+    EXPORT_POLICY
+        .set(policy)
+        .map_err(|_| VmError::InvalidMemoryConfiguration("export policy already set".into()))?;
+    UFFD_WP
+        .set(uffd_wp)
+        .map_err(|_| VmError::InvalidMemoryConfiguration("UFFD policy already set".into()))
+}
+/// Validate CLI policy without touching hardware.
+pub fn parse_export_policy(value: Option<&str>) -> Result<ExportPolicy, VmError> {
+    match value.unwrap_or("hybrid") {
+        "hybrid" => Ok(ExportPolicy::Hybrid),
+        "batched" => Ok(ExportPolicy::Batched),
+        "bitmap" => Ok(ExportPolicy::Bitmap),
+        _ => Err(VmError::InvalidMemoryConfiguration(
+            "dirty-export-policy must be hybrid, batched, or bitmap".into(),
+        )),
+    }
+}
+/// Current process-wide export policy.
+pub fn export_policy() -> ExportPolicy {
+    *EXPORT_POLICY.get().unwrap_or(&ExportPolicy::Hybrid)
+}
+/// Whether this process requests the separate UFFD WP_ASYNC baseline.
+pub fn uffd_wp_async() -> bool {
+    *UFFD_WP.get().unwrap_or(&false)
+}
+
 static SOFTWARE_BITMAP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 static ORDER: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
 
@@ -37,6 +81,11 @@ pub fn parse_order(value: Option<&str>) -> Result<u32, VmError> {
 pub fn configure(kvm: &Kvm, vm: &mut Vm) -> Result<(), VmError> {
     let order = *ORDER.get().unwrap_or(&0);
     vm.common.track_dirty_export = order != 0 || *SOFTWARE_BITMAP.get().unwrap_or(&false);
+    if export_policy() == ExportPolicy::Bitmap && !vm.common.track_dirty_export {
+        return Err(VmError::InvalidMemoryConfiguration(
+            "bitmap policy requires --kvm-dirty-bitmap or --hdbss-order".into(),
+        ));
+    }
     if vm.common.track_dirty_export && crate::arch::host_page_size() != 4096 {
         return Err(VmError::InvalidMemoryConfiguration(
             "dirty export requires 4KiB host pages".into(),
@@ -124,6 +173,22 @@ mod tests {
         assert_eq!(vm.get_dirty_bitmap().unwrap()[&0][0] & 2, 2);
         vm.guest_memory().reset_dirty();
         assert_eq!(vm.get_dirty_bitmap().unwrap()[&0][0] & 2, 2);
+    }
+
+    #[test]
+    fn validates_export_policy() {
+        assert_eq!(parse_export_policy(None).unwrap(), ExportPolicy::Hybrid);
+        assert_eq!(
+            parse_export_policy(Some("bitmap")).unwrap(),
+            ExportPolicy::Bitmap
+        );
+        assert_eq!(
+            parse_export_policy(Some("batched")).unwrap(),
+            ExportPolicy::Batched
+        );
+        for value in ["", "auto", "Bitmap", "bitmap;exit"] {
+            assert!(parse_export_policy(Some(value)).is_err());
+        }
     }
 
     #[test]

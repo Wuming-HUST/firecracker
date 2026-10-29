@@ -140,12 +140,12 @@ use crate::device_manager::legacy::PortIODeviceManager;
 use crate::device_manager::mmio::MMIODeviceManager;
 use crate::devices::legacy::{IER_RDA_BIT, IER_RDA_OFFSET};
 use crate::devices::virtio::balloon::{
-    BALLOON_DEV_ID, Balloon, BalloonConfig, BalloonError, BalloonStats,
+    Balloon, BalloonConfig, BalloonError, BalloonStats, BALLOON_DEV_ID,
 };
 use crate::devices::virtio::block::device::Block;
 use crate::devices::virtio::net::Net;
 use crate::devices::virtio::{TYPE_BALLOON, TYPE_BLOCK, TYPE_NET};
-use crate::logger::{METRICS, MetricsError, error, info, warn};
+use crate::logger::{error, info, warn, MetricsError, METRICS};
 use crate::persist::{MicrovmState, MicrovmStateError, VmInfo};
 use crate::rate_limiter::BucketUpdate;
 use crate::snapshot::Persist;
@@ -399,6 +399,8 @@ impl Vmm {
 
     /// Sends a resume command to the vCPUs.
     pub fn resume_vm(&mut self) -> Result<(), VmmError> {
+        self.mmio_device_manager
+            .freeze_external_snapshot_devices(false);
         self.mmio_device_manager.kick_devices();
 
         // Send the events.
@@ -766,56 +768,89 @@ impl Vmm {
     /// A set bit indicates the page is present in RAM and has been written to (not write-protected).
     /// Pages are ordered in the same order as reported by `/memory/mappings`.
     pub fn get_dirty_memory(&self, page_size: usize) -> Result<Vec<u64>, VmmError> {
-        // Include hardware and VMM writes even if pages are swapped out; keep the
-        // existing UFFD-WP/pagemap path for userspace COPY writes and baseline compatibility.
-        let hardware = if self.vm.common.track_dirty_export {
+        use crate::utils::dirty_tracking::{mask_tail, or_words, DirtyStats};
+        use crate::vstate::hdbss::{self, ExportPolicy};
+        use std::time::Instant;
+        let start = Instant::now();
+        let policy = hdbss::export_policy();
+        let (hardware, mut stats) = if self.vm.common.track_dirty_export {
             if page_size != 4096 {
                 return Err(vstate::vm::VmError::InvalidMemoryConfiguration(
-                    "HDBSS export requires 4KiB pages".into(),
+                    "dirty export requires 4KiB pages".into(),
                 )
                 .into());
             }
-            Some(
-                self.vm
-                    .get_dirty_bitmap()
-                    .map_err(vstate::vm::VmError::GetDirtyLog)?,
-            )
+            let (bits, measured) = self
+                .vm
+                .get_dirty_bitmap_measured()
+                .map_err(vstate::vm::VmError::GetDirtyLog)?;
+            (Some(bits), measured)
         } else {
-            None
+            (None, DirtyStats::default())
         };
-        let pagemap = utils::pagemap::PagemapReader::new(page_size)?;
+        if policy == ExportPolicy::Bitmap && hardware.is_none() {
+            return Err(vstate::vm::VmError::InvalidMemoryConfiguration(
+                "bitmap export requires KVM dirty logging".into(),
+            )
+            .into());
+        }
+        stats.policy = format!("{policy:?}").to_lowercase();
+        stats.hdbss_order = self.vm.common.hdbss_order;
+        let pagemap = if policy == ExportPolicy::Bitmap {
+            None
+        } else {
+            Some(utils::pagemap::PagemapReader::new(page_size)?)
+        };
         let mut dirty_bitmap = vec![];
-
         for (slot, region) in self.vm.guest_memory().iter().enumerate() {
             let base_addr = region.as_ptr() as usize;
             let len = region.size() as usize;
             let nr_pages = len / page_size;
-
-            // Use mincore to get resident pages bitmap at guest page size granularity
-            let resident_bitmap = vstate::vm::mincore_bitmap(base_addr as *mut u8, len, page_size)?;
-
-            // Build dirty bitmap: check pagemap only for pages that mincore reports resident.
-            // This reduces the number of /proc/self/pagemap reads.
+            stats.pages += nr_pages as u64;
+            let scan_start = Instant::now();
             let mut slot_bitmap = vec![0u64; nr_pages.div_ceil(64)];
-            for page_idx in 0..nr_pages {
-                let is_resident = (resident_bitmap[page_idx / 64] & (1u64 << (page_idx % 64))) != 0;
-                if is_resident {
-                    let virt_addr = base_addr + (page_idx * page_size);
-                    if pagemap.is_page_dirty(virt_addr)? {
-                        slot_bitmap[page_idx / 64] |= 1u64 << (page_idx % 64);
+            if let Some(ref pagemap) = pagemap {
+                let resident = vstate::vm::mincore_bitmap(base_addr as *mut u8, len, page_size)?;
+                if policy == ExportPolicy::Batched {
+                    let (bits, reads, bytes) =
+                        pagemap.scan_batched(base_addr, nr_pages, page_size, &resident)?;
+                    slot_bitmap = bits;
+                    stats.pagemap_reads += reads;
+                    stats.pagemap_bytes += bytes;
+                } else {
+                    for page in 0..nr_pages {
+                        if resident[page / 64] & (1u64 << (page % 64)) != 0 {
+                            stats.pagemap_reads += 1;
+                            stats.pagemap_bytes += 8;
+                            if pagemap.is_page_dirty(base_addr + page * page_size)? {
+                                slot_bitmap[page / 64] |= 1u64 << (page % 64);
+                            }
+                        }
                     }
                 }
             }
-
+            stats.pagemap_ns += scan_start.elapsed().as_nanos() as u64;
             if let Some(ref hardware) = hardware {
                 if let Some(bits) = hardware.get(&(slot as u32)) {
-                    for (dst, src) in slot_bitmap.iter_mut().zip(bits) {
-                        *dst |= *src;
-                    }
+                    stats.kernel_vmm_pages +=
+                        bits.iter().map(|x| x.count_ones() as u64).sum::<u64>();
+                    stats.pagemap_only_pages += slot_bitmap
+                        .iter()
+                        .zip(bits)
+                        .map(|(p, k)| (p & !k).count_ones() as u64)
+                        .sum::<u64>();
+                    or_words(&mut slot_bitmap, bits);
                 }
             }
+            mask_tail(&mut slot_bitmap, nr_pages);
+            stats.selected_pages += slot_bitmap
+                .iter()
+                .map(|x| x.count_ones() as u64)
+                .sum::<u64>();
             dirty_bitmap.extend_from_slice(&slot_bitmap);
         }
+        stats.total_ns = start.elapsed().as_nanos() as u64;
+        info!("DIRTY_STATS {}", serde_json::to_string(&stats).unwrap());
 
         Ok(dirty_bitmap)
     }

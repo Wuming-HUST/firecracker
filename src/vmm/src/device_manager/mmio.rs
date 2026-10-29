@@ -11,7 +11,7 @@ use std::num::NonZeroU32;
 use std::sync::{Arc, Mutex};
 
 #[cfg(target_arch = "x86_64")]
-use acpi_tables::{Aml, aml};
+use acpi_tables::{aml, Aml};
 use kvm_ioctls::{IoEventAddress, VmFd};
 use linux_loader::cmdline as kernel_cmdline;
 #[cfg(target_arch = "x86_64")]
@@ -23,7 +23,6 @@ use vm_allocator::AllocPolicy;
 use super::resources::ResourceAllocator;
 use crate::arch::DeviceType;
 use crate::arch::DeviceType::Virtio;
-use crate::devices::BusDevice;
 #[cfg(target_arch = "aarch64")]
 use crate::devices::legacy::RTCDevice;
 use crate::devices::pseudo::BootTimer;
@@ -33,8 +32,9 @@ use crate::devices::virtio::device::VirtioDevice;
 use crate::devices::virtio::mmio::MmioTransport;
 use crate::devices::virtio::net::Net;
 use crate::devices::virtio::rng::Entropy;
-use crate::devices::virtio::vsock::{TYPE_VSOCK, Vsock, VsockUnixBackend};
+use crate::devices::virtio::vsock::{Vsock, VsockUnixBackend, TYPE_VSOCK};
 use crate::devices::virtio::{TYPE_BALLOON, TYPE_BLOCK, TYPE_NET, TYPE_RNG};
+use crate::devices::BusDevice;
 #[cfg(target_arch = "x86_64")]
 use crate::vstate::memory::GuestAddress;
 
@@ -446,6 +446,30 @@ impl MMIODeviceManager {
         Ok(())
     }
 
+    /// Freeze net/block event handling while external RAM export follows state save.
+    pub fn freeze_external_snapshot_devices(&self, frozen: bool) {
+        let _: Result<(), MmioError> = self.for_each_virtio_device(|kind, _, _, dev| {
+            let mut device = dev.lock().expect("Poisoned lock");
+            match kind {
+                TYPE_NET => {
+                    device
+                        .as_mut_any()
+                        .downcast_mut::<Net>()
+                        .unwrap()
+                        .external_snapshot_frozen = frozen
+                }
+                TYPE_BLOCK => {
+                    if let Some(Block::Virtio(block)) = device.as_mut_any().downcast_mut::<Block>()
+                    {
+                        block.external_snapshot_frozen = frozen;
+                    }
+                }
+                _ => {}
+            }
+            Ok(())
+        });
+    }
+
     /// Artificially kick devices as if they had external events.
     pub fn kick_devices(&self) {
         info!("Artificially kick devices.");
@@ -528,13 +552,13 @@ mod tests {
     use vmm_sys_util::eventfd::EventFd;
 
     use super::*;
-    use crate::Vm;
-    use crate::devices::virtio::ActivateError;
     use crate::devices::virtio::device::{IrqTrigger, VirtioDevice};
     use crate::devices::virtio::queue::Queue;
+    use crate::devices::virtio::ActivateError;
     use crate::test_utils::multi_region_mem_raw;
     use crate::vstate::kvm::Kvm;
     use crate::vstate::memory::{GuestAddress, GuestMemoryMmap};
+    use crate::Vm;
 
     const QUEUE_SIZES: &[u16] = &[64];
 
@@ -763,11 +787,9 @@ mod tests {
                 &id,
             )
             .unwrap();
-        assert!(
-            device_manager
-                .get_device(DeviceType::Virtio(type_id), &id)
-                .is_some()
-        );
+        assert!(device_manager
+            .get_device(DeviceType::Virtio(type_id), &id)
+            .is_some());
         assert_eq!(
             addr,
             device_manager.id_to_dev_info[&(DeviceType::Virtio(type_id), id.clone())].addr
@@ -781,11 +803,9 @@ mod tests {
         );
 
         let id = "bar";
-        assert!(
-            device_manager
-                .get_device(DeviceType::Virtio(type_id), id)
-                .is_none()
-        );
+        assert!(device_manager
+            .get_device(DeviceType::Virtio(type_id), id)
+            .is_none());
 
         let dummy2 = Arc::new(Mutex::new(DummyDevice::new()));
         let id2 = String::from("foo2");

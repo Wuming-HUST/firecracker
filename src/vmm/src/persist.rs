@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 
 use semver::Version;
 use serde::{Deserialize, Serialize};
-use userfaultfd::{FeatureFlags, Uffd, UffdBuilder};
+use userfaultfd::{FeatureFlags, RegisterMode, Uffd, UffdBuilder};
 use vmm_sys_util::sock_ctrl_msg::ScmSocket;
 
 #[cfg(target_arch = "aarch64")]
@@ -22,9 +22,9 @@ use crate::arch::aarch64::vcpu::get_manufacturer_id_from_host;
 use crate::builder::{self, BuildMicrovmFromSnapshotError};
 use crate::cpu_config::templates::StaticCpuTemplate;
 #[cfg(target_arch = "x86_64")]
-use crate::cpu_config::x86_64::cpuid::CpuidTrait;
-#[cfg(target_arch = "x86_64")]
 use crate::cpu_config::x86_64::cpuid::common::get_vendor_id_from_host;
+#[cfg(target_arch = "x86_64")]
+use crate::cpu_config::x86_64::cpuid::CpuidTrait;
 use crate::device_manager::persist::{ACPIDeviceManagerState, DevicePersistError, DeviceStates};
 use crate::logger::{info, warn};
 use crate::resources::VmResources;
@@ -40,7 +40,7 @@ use crate::vstate::memory;
 use crate::vstate::memory::{GuestMemoryState, GuestRegionMmap, MemoryError};
 use crate::vstate::vcpu::{VcpuSendEventError, VcpuState};
 use crate::vstate::vm::VmState;
-use crate::{EventManager, Vmm, vstate};
+use crate::{vstate, EventManager, Vmm};
 
 /// Holds information related to the VM that is not part of VmState.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
@@ -156,6 +156,14 @@ pub fn create_snapshot(
     vm_info: &VmInfo,
     params: &CreateSnapshotParams,
 ) -> Result<(), CreateSnapshotError> {
+    // The lab exports memory through later API calls. Unlike an in-process
+    // snapshot, its CPU/device state and RAM copy span multiple epoll iterations.
+    // Stop net/block event handlers before saving either side of that boundary.
+    // Block prepare_save below drains outstanding async IO before state is saved.
+    if vmm.vm.common.track_dirty_export && params.mem_file_path.is_none() {
+        vmm.mmio_device_manager
+            .freeze_external_snapshot_devices(true);
+    }
     let microvm_state = vmm
         .save_state(vm_info)
         .map_err(CreateSnapshotError::MicrovmState)?;
@@ -490,7 +498,14 @@ fn guest_memory_from_uffd(
     // because the only place the kernel checks this is in a hook from madvise, e.g. it doesn't
     // actively change the behavior of UFFD, only passively. Without balloon devices
     // we never call madvise anyway, so no need to put this into a conditional.
-    uffd_builder.require_features(FeatureFlags::EVENT_REMOVE);
+    let wp_async = crate::vstate::hdbss::uffd_wp_async();
+    // WP_ASYNC is a newer UAPI bit than this pinned crate. Keep unknown bits
+    // explicitly; unsupported kernels fail negotiation rather than falling back.
+    let mut features = FeatureFlags::EVENT_REMOVE;
+    if wp_async {
+        features |= FeatureFlags::PAGEFAULT_FLAG_WP | FeatureFlags::from_bits_retain(1 << 15);
+    }
+    uffd_builder.require_features(features);
 
     let uffd = uffd_builder
         .close_on_exec(true)
@@ -500,7 +515,12 @@ fn guest_memory_from_uffd(
         .map_err(GuestMemoryFromUffdError::Create)?;
 
     for mem_region in guest_memory.iter() {
-        uffd.register(mem_region.as_ptr().cast(), mem_region.size() as _)
+        let mode = if wp_async {
+            RegisterMode::from_bits_retain(1 | 2)
+        } else {
+            RegisterMode::MISSING
+        };
+        uffd.register_with_mode(mem_region.as_ptr().cast(), mem_region.size() as _, mode)
             .map_err(GuestMemoryFromUffdError::Register)?;
     }
 
@@ -592,12 +612,11 @@ mod tests {
     use vmm_sys_util::tempfile::TempFile;
 
     use super::*;
-    use crate::Vmm;
     #[cfg(target_arch = "x86_64")]
     use crate::builder::tests::insert_vmgenid_device;
     use crate::builder::tests::{
-        CustomBlockConfig, default_kernel_cmdline, default_vmm, insert_balloon_device,
-        insert_block_devices, insert_net_device, insert_vsock_device,
+        default_kernel_cmdline, default_vmm, insert_balloon_device, insert_block_devices,
+        insert_net_device, insert_vsock_device, CustomBlockConfig,
     };
     #[cfg(target_arch = "aarch64")]
     use crate::construct_kvm_mpidrs;
@@ -607,6 +626,7 @@ mod tests {
     use crate::vmm_config::net::NetworkInterfaceConfig;
     use crate::vmm_config::vsock::tests::default_config;
     use crate::vstate::memory::GuestMemoryRegionState;
+    use crate::Vmm;
 
     fn default_vmm_with_devices() -> Vmm {
         let mut event_manager = EventManager::new().expect("Cannot create EventManager");

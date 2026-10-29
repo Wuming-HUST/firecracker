@@ -7,7 +7,7 @@ use vmm_sys_util::epoll::EventSet;
 use crate::devices::virtio::device::VirtioDevice;
 use crate::devices::virtio::net::device::Net;
 use crate::devices::virtio::net::{RX_INDEX, TX_INDEX};
-use crate::logger::{IncMetric, error, warn};
+use crate::logger::{error, warn, IncMetric};
 
 impl Net {
     const PROCESS_ACTIVATE: u32 = 0;
@@ -82,6 +82,9 @@ impl Net {
 
 impl MutEventSubscriber for Net {
     fn process(&mut self, event: Events, ops: &mut EventOps) {
+        if self.external_snapshot_frozen {
+            return;
+        }
         let source = event.data();
         let event_set = event.event_set();
 
@@ -132,8 +135,8 @@ impl MutEventSubscriber for Net {
 
 #[cfg(test)]
 pub mod tests {
-    use crate::devices::virtio::net::test_utils::NetQueue;
     use crate::devices::virtio::net::test_utils::test::TestHelper;
+    use crate::devices::virtio::net::test_utils::NetQueue;
     use crate::devices::virtio::net::{MAX_BUFFER_SIZE, TX_INDEX};
     use crate::test_utils::single_region_mem;
 

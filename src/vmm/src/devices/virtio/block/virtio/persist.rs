@@ -3,8 +3,8 @@
 
 //! Defines the structures needed for saving/restoring block devices.
 
-use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
+use std::sync::Arc;
 
 use device::ConfigSpace;
 use serde::{Deserialize, Serialize};
@@ -12,15 +12,15 @@ use vmm_sys_util::eventfd::EventFd;
 
 use super::device::DiskProperties;
 use super::*;
-use crate::devices::virtio::TYPE_BLOCK;
 use crate::devices::virtio::block::persist::BlockConstructorArgs;
 use crate::devices::virtio::block::virtio::device::FileEngineType;
 use crate::devices::virtio::block::virtio::metrics::BlockMetricsPerDevice;
 use crate::devices::virtio::device::{DeviceState, IrqTrigger};
 use crate::devices::virtio::generated::virtio_blk::VIRTIO_BLK_F_RO;
 use crate::devices::virtio::persist::VirtioDeviceState;
-use crate::rate_limiter::RateLimiter;
+use crate::devices::virtio::TYPE_BLOCK;
 use crate::rate_limiter::persist::RateLimiterState;
+use crate::rate_limiter::RateLimiter;
 use crate::snapshot::Persist;
 
 /// Holds info about block's file engine type. Gets saved in snapshot.
@@ -128,6 +128,7 @@ impl Persist<'_> for VirtioBlock {
         };
 
         Ok(VirtioBlock {
+            external_snapshot_frozen: false,
             avail_features,
             acked_features,
             config_space,

@@ -11,6 +11,8 @@ pub mod signal;
 pub mod sm;
 /// Module with pagemap utilities
 pub mod pagemap;
+/// Dirty bitmap collection counters and word operations.
+pub mod dirty_tracking;
 
 use std::num::Wrapping;
 use std::result::Result;

@@ -22,7 +22,7 @@ use utils::validators::validate_instance_id;
 use vmm::arch::host_page_size;
 use vmm::builder::StartMicrovmError;
 use vmm::logger::{
-    LOGGER, LoggerConfig, METRICS, ProcessTimeReporter, StoreMetric, debug, error, info,
+    debug, error, info, LoggerConfig, ProcessTimeReporter, StoreMetric, LOGGER, METRICS,
 };
 use vmm::persist::SNAPSHOT_VERSION;
 use vmm::resources::VmResources;
@@ -30,7 +30,7 @@ use vmm::seccomp::BpfThreadMap;
 use vmm::signal_handler::register_signal_handlers;
 use vmm::snapshot::{Snapshot, SnapshotError};
 use vmm::vmm_config::instance_info::{InstanceInfo, VmState};
-use vmm::vmm_config::metrics::{MetricsConfig, MetricsConfigError, init_metrics};
+use vmm::vmm_config::metrics::{init_metrics, MetricsConfig, MetricsConfigError};
 use vmm::{EventManager, FcExitCode, HTTP_MAX_PAYLOAD_SIZE};
 use vmm_sys_util::terminal::Terminal;
 
@@ -149,6 +149,14 @@ fn main_exec() -> Result<(), MainError> {
                 Argument::new("kvm-dirty-bitmap").takes_value(false).help(
                     "Export cumulative software KVM dirty bitmap for HDBSS control experiments",
                 ),
+            )
+            .arg(Argument::new("dirty-export-policy").takes_value(true).help(
+                "Dirty selection: hybrid (default), batched, or bitmap (requires dirty logging)",
+            ))
+            .arg(
+                Argument::new("uffd-wp-async")
+                    .takes_value(false)
+                    .help("Require asynchronous UFFD write protection on snapshot restore"),
             )
             .arg(
                 Argument::new("hdbss-order")
@@ -329,6 +337,14 @@ fn main_exec() -> Result<(), MainError> {
     vmm::vstate::hdbss::set_order(
         arguments.single_value("hdbss-order").map(String::as_str),
         arguments.flag_present("kvm-dirty-bitmap"),
+    )
+    .map_err(|e| MainError::MemoryTracking(e.to_string()))?;
+
+    vmm::vstate::hdbss::set_export_policy(
+        arguments
+            .single_value("dirty-export-policy")
+            .map(String::as_str),
+        arguments.flag_present("uffd-wp-async"),
     )
     .map_err(|e| MainError::MemoryTracking(e.to_string()))?;
 
