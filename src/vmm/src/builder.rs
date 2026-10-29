@@ -486,6 +486,9 @@ pub fn build_microvm_from_snapshot(
     vmm.mmio_device_manager =
         MMIODeviceManager::restore(mmio_ctor_args, &microvm_state.device_states)
             .map_err(MicrovmStateError::RestoreDevices)?;
+    // ARM restores full UART state, including THRE interrupts. The legacy
+    // RDA-only workaround would overwrite its saved interrupt-enable register.
+    #[cfg(target_arch = "x86_64")]
     vmm.emulate_serial_init()?;
 
     {
@@ -536,17 +539,29 @@ pub fn setup_serial_device(
     input: std::io::Stdin,
     out: std::io::Stdout,
 ) -> Result<Arc<Mutex<BusDevice>>, VmmError> {
+    setup_serial_device_from_state(event_manager, input, out, None)
+}
+
+/// Sets up UART from persisted registers and FIFO, reasserting pending IRQs.
+pub fn setup_serial_device_from_state(
+    event_manager: &mut EventManager,
+    input: std::io::Stdin,
+    out: std::io::Stdout,
+    state: Option<&vm_superio::serial::SerialState>,
+) -> Result<Arc<Mutex<BusDevice>>, VmmError> {
     let interrupt_evt = EventFdTrigger::new(EventFd::new(EFD_NONBLOCK).map_err(VmmError::EventFd)?);
     let kick_stdin_read_evt =
         EventFdTrigger::new(EventFd::new(EFD_NONBLOCK).map_err(VmmError::EventFd)?);
     let serial = Arc::new(Mutex::new(BusDevice::Serial(SerialWrapper {
-        serial: Serial::with_events(
+        serial: Serial::from_state(
+            state.unwrap_or(&vm_superio::serial::SerialState::default()),
             interrupt_evt,
             SerialEventsWrapper {
                 buffer_ready_event_fd: Some(kick_stdin_read_evt),
             },
             SerialOut::Stdout(out),
-        ),
+        )
+        .map_err(|e| VmmError::Serial(io::Error::other(format!("{e:?}"))))?,
         input: Some(input),
     })));
     event_manager.add_subscriber(serial.clone());

@@ -145,6 +145,8 @@ pub struct ConnectedEntropyState {
 #[cfg(target_arch = "aarch64")]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConnectedLegacyState {
+    /// Full UART registers and receive FIFO; absent for RTC.
+    pub serial: Option<crate::devices::legacy::serial::SerialSnapshot>,
     /// Device identifier.
     pub type_: DeviceType,
     /// VmmResources.
@@ -294,7 +296,21 @@ impl<'a> Persist<'a> for MMIODeviceManager {
             #[cfg(target_arch = "aarch64")]
             {
                 if *devtype == DeviceType::Serial || *devtype == DeviceType::Rtc {
+                    let serial = if *devtype == DeviceType::Serial {
+                        Some(crate::devices::legacy::serial::SerialSnapshot(
+                            bus_dev
+                                .lock()
+                                .expect("Poisoned lock")
+                                .serial_ref()
+                                .expect("Unexpected device type")
+                                .serial
+                                .state(),
+                        ))
+                    } else {
+                        None
+                    };
                     states.legacy_devices.push(ConnectedLegacyState {
+                        serial,
                         type_: *devtype,
                         device_info: device_info.clone(),
                     });
@@ -421,10 +437,21 @@ impl<'a> Persist<'a> for MMIODeviceManager {
         {
             for state in &state.legacy_devices {
                 if state.type_ == DeviceType::Serial {
-                    let serial = crate::builder::setup_serial_device(
+                    let serial = crate::builder::setup_serial_device_from_state(
                         constructor_args.event_manager,
                         std::io::stdin(),
                         std::io::stdout(),
+                        Some(
+                            &state
+                                .serial
+                                .as_ref()
+                                .ok_or_else(|| {
+                                    crate::VmmError::Serial(std::io::Error::other(
+                                        "missing UART snapshot state",
+                                    ))
+                                })?
+                                .0,
+                        ),
                     )?;
 
                     constructor_args
@@ -734,6 +761,66 @@ mod tests {
         }
     }
 
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn test_uart_manager_restores_transmit_interrupt() {
+        let mut events = EventManager::new().unwrap();
+        let mut original = default_vmm();
+        let uart =
+            crate::builder::setup_serial_device(&mut events, std::io::stdin(), std::io::stdout())
+                .unwrap();
+        {
+            let mut device = uart.lock().unwrap();
+            let serial = &mut device.serial_mut().unwrap().serial;
+            serial.write(1, 3).unwrap(); // RDA + THRE enabled by guest tty driver
+            serial.enqueue_raw_bytes(b"pending").unwrap();
+        }
+        original
+            .mmio_device_manager
+            .register_mmio_serial(
+                original.vm.fd(),
+                &mut original.resource_allocator,
+                uart,
+                None,
+            )
+            .unwrap();
+        let state = original.mmio_device_manager.save();
+        let mut wire = Vec::new();
+        Snapshot::serialize(&mut wire, &state).unwrap();
+        let saved: DeviceStates = Snapshot::deserialize(&mut wire.as_slice()).unwrap();
+        let restored = default_vmm();
+        let mut allocator = ResourceAllocator::new().unwrap();
+        let mut resources = VmResources::default();
+        let manager = MMIODeviceManager::restore(
+            MMIODevManagerConstructorArgs {
+                mem: restored.vm.guest_memory(),
+                vm: restored.vm.fd(),
+                event_manager: &mut events,
+                resource_allocator: &mut allocator,
+                vm_resources: &mut resources,
+                instance_id: "uart-regression",
+                restored_from_file: true,
+            },
+            &saved,
+        )
+        .unwrap();
+        // Read live UART registers through the restored manager, rather than
+        // testing a standalone state clone.
+        let mut serials = 0;
+        let _: Result<(), ()> = manager.for_each_device(|kind, _, _, device| {
+            if *kind == DeviceType::Serial {
+                let mut locked = device.lock().unwrap();
+                let uart = &mut locked.serial_mut().unwrap().serial;
+                serials += 1;
+                assert_eq!(uart.read(1), 3, "restored UART lost THRE enable");
+                assert_eq!(uart.read(0), b'p', "restored UART lost receive FIFO");
+                assert!(uart.interrupt_evt().read().unwrap() > 0);
+            }
+            Ok(())
+        });
+        assert_eq!(serials, 1);
+    }
+
     #[test]
     fn test_device_manager_persistence() {
         let mut buf = vec![0; 16384];
@@ -822,7 +909,8 @@ mod tests {
   "balloon": {{
     "amount_mib": 123,
     "deflate_on_oom": false,
-    "stats_polling_interval_s": 1
+    "stats_polling_interval_s": 1,
+    "free_page_reporting": false
   }},
   "drives": [
     {{

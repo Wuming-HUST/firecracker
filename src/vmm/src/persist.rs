@@ -147,7 +147,11 @@ pub enum CreateSnapshotError {
     SnapshotBackingFile(&'static str, io::Error),
 }
 
-/// Snapshot version
+/// ARM v7 adds full UART state; v6 snapshots cannot represent pending TX IRQs.
+#[cfg(target_arch = "aarch64")]
+pub const SNAPSHOT_VERSION: Version = Version::new(7, 0, 0);
+/// x86 snapshot layout is unchanged.
+#[cfg(target_arch = "x86_64")]
 pub const SNAPSHOT_VERSION: Version = Version::new(6, 0, 0);
 
 /// Creates a Microvm snapshot.

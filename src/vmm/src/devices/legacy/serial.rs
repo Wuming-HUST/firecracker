@@ -13,7 +13,7 @@ use std::os::unix::io::{AsRawFd, RawFd};
 
 use event_manager::{EventOps, Events, MutEventSubscriber};
 use log::{error, warn};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use vm_superio::serial::{Error as SerialError, SerialEvents};
 use vm_superio::{Serial, Trigger};
 use vmm_sys_util::epoll::EventSet;
@@ -26,6 +26,25 @@ use crate::logger::{IncMetric, SharedIncMetric};
 pub const IER_RDA_BIT: u8 = 0b0000_0001;
 /// Received Data Available interrupt offset
 pub const IER_RDA_OFFSET: u8 = 1;
+
+/// Full UART state. The enclosing snapshot format is bound to its VMM binary.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SerialSnapshot(#[serde(with = "SerialStateDef")] pub vm_superio::serial::SerialState);
+
+#[derive(Serialize, Deserialize)]
+#[serde(remote = "vm_superio::serial::SerialState")]
+struct SerialStateDef {
+    baud_divisor_low: u8,
+    baud_divisor_high: u8,
+    interrupt_enable: u8,
+    interrupt_identification: u8,
+    line_control: u8,
+    line_status: u8,
+    modem_control: u8,
+    modem_status: u8,
+    scratch: u8,
+    in_buffer: Vec<u8>,
+}
 
 /// Metrics specific to the UART device.
 #[derive(Debug, Serialize, Default)]
@@ -369,6 +388,44 @@ mod tests {
 
     use super::*;
     use crate::logger::IncMetric;
+
+    #[test]
+    fn test_snapshot_preserves_pending_tx_and_rx_interrupts() {
+        fn uart() -> Serial<EventFdTrigger, SerialEventsWrapper, SerialOut> {
+            Serial::with_events(
+                EventFdTrigger::new(EventFd::new(libc::EFD_NONBLOCK).unwrap()),
+                SerialEventsWrapper {
+                    buffer_ready_event_fd: None,
+                },
+                SerialOut::Sink(std::io::sink()),
+            )
+        }
+        let mut original = uart();
+        // Linux may snapshot with a nonempty tty output queue, waiting for THRE.
+        original.write(IER_RDA_OFFSET, 3).unwrap();
+        original.enqueue_raw_bytes(b"pending-rx").unwrap();
+        original.write(7, 0x5a).unwrap();
+        let saved = original.state();
+        let mut bytes = Vec::new();
+        crate::snapshot::Snapshot::serialize(&mut bytes, &SerialSnapshot(saved.clone())).unwrap();
+        let decoded: SerialSnapshot =
+            crate::snapshot::Snapshot::deserialize(&mut bytes.as_slice()).unwrap();
+        assert_eq!(decoded.0, saved);
+        let mut restored = Serial::from_state(
+            &decoded.0,
+            EventFdTrigger::new(EventFd::new(libc::EFD_NONBLOCK).unwrap()),
+            SerialEventsWrapper {
+                buffer_ready_event_fd: None,
+            },
+            SerialOut::Sink(std::io::sink()),
+        )
+        .unwrap();
+        // Pending interrupts must be reasserted on the new eventfd.
+        assert!(restored.interrupt_evt().read().unwrap() > 0);
+        assert_eq!(restored.read(IER_RDA_OFFSET), 3);
+        assert_eq!(restored.read(0), b'p');
+        assert_eq!(restored.read(7), 0x5a);
+    }
 
     #[test]
     fn test_serial_bus_read() {
