@@ -854,7 +854,20 @@ impl RuntimeApiController {
         let elapsed_time_us = get_time_us(ClockType::Monotonic) - start_us;
         info!("'get dirty memory' VMM action took {elapsed_time_us} us.");
 
-        Ok(VmmData::MemoryDirty(MemoryDirty { bitmap }))
+        use crate::vstate::hdbss::{self, ExportPolicy};
+        use crate::vstate::memory::{GuestMemory, GuestMemoryRegion};
+        Ok(VmmData::MemoryDirty(MemoryDirty {
+            bitmap,
+            tracking_version: 1,
+            tracking_mode: format!("{:?}", hdbss::export_policy()).to_lowercase(),
+            tracking_complete: vmm.vm.common.track_dirty_export
+                && hdbss::export_policy() == ExportPolicy::Bitmap
+                && page_size == 4096
+                && vmm.vm.guest_memory().iter().all(|r| r.bitmap().is_some()),
+            capture_ready: vmm.external_capture_ready,
+            logical_size: vmm.vm.guest_memory().iter().map(|r| r.len()).sum(),
+            page_size: page_size as u64,
+        }))
     }
 
     /// Updates block device properties:

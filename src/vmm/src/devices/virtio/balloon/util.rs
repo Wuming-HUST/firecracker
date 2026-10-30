@@ -6,7 +6,9 @@ use std::io;
 use super::{MAX_PAGE_COMPACT_BUFFER, RemoveRegionError};
 use crate::logger::error;
 use crate::utils::u64_to_usize;
-use crate::vstate::memory::{GuestAddress, GuestMemory, GuestMemoryMmap, GuestMemoryRegion};
+use crate::vstate::memory::{
+    GuestAddress, GuestMemory, GuestMemoryExtension, GuestMemoryMmap, GuestMemoryRegion,
+};
 
 /// This takes a vector of page frame numbers, and compacts them
 /// into ranges of consecutive pages. The result is a vector
@@ -70,15 +72,31 @@ pub(crate) fn remove_range(
     range: (GuestAddress, u64),
     restored_from_file: bool,
 ) -> Result<(), RemoveRegionError> {
+    remove_range_with_advice(guest_memory, range, restored_from_file, |address, len| {
+        // SAFETY: The helper validates the region before invoking this closure.
+        unsafe { libc::madvise(address, len, libc::MADV_DONTNEED) }
+    })
+}
+
+fn remove_range_with_advice(
+    guest_memory: &GuestMemoryMmap,
+    range: (GuestAddress, u64),
+    restored_from_file: bool,
+    advice: impl FnOnce(*mut libc::c_void, usize) -> libc::c_int,
+) -> Result<(), RemoveRegionError> {
     let (guest_address, range_len) = range;
 
     if let Some(region) = guest_memory.find_region(guest_address) {
-        if guest_address.0 + range_len > region.start_addr().0 + region.len() {
+        if range_len == 0 || range_len > region.len() - (guest_address.0 - region.start_addr().0) {
             return Err(RemoveRegionError::MalformedRange);
         }
         let phys_address = guest_memory
             .get_host_address(guest_address)
             .map_err(|_| RemoveRegionError::AddressTranslation)?;
+
+        // Record before the first mutation: mmap may succeed even if madvise
+        // later fails. Discard is a logical write even without a resident PTE.
+        guest_memory.mark_dirty(guest_address, u64_to_usize(range_len));
 
         // Mmap a new anonymous region over the present one in order to create a hole.
         // This workaround is (only) needed after resuming from a snapshot because the guest memory
@@ -101,11 +119,7 @@ pub(crate) fn remove_range(
         };
 
         // Madvise the region in order to mark it as not used.
-        // SAFETY: The address and length are known to be valid.
-        let ret = unsafe {
-            let range_len = u64_to_usize(range_len);
-            libc::madvise(phys_address.cast(), range_len, libc::MADV_DONTNEED)
-        };
+        let ret = advice(phys_address.cast(), u64_to_usize(range_len));
         if ret < 0 {
             return Err(RemoveRegionError::MadviseFail(io::Error::last_os_error()));
         }
@@ -254,6 +268,49 @@ mod tests {
             remove_range(&mem, (GuestAddress(0x20), page_size as u64), true).unwrap_err(),
             RemoveRegionError::MmapFail(_)
         );
+    }
+
+    #[test]
+    fn discard_marks_dirty_without_a_cpu_write() {
+        use vm_memory::bitmap::Bitmap;
+        let page = 4096;
+        for restored in [false, true] {
+            let mem = GuestMemoryMmap::from_regions(
+                crate::vstate::memory::anonymous(
+                    [(GuestAddress(0), 3 * page)].into_iter(),
+                    true,
+                    crate::vmm_config::machine_config::HugePageConfig::None,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            mem.write(&vec![0x5a; 3 * page], GuestAddress(0)).unwrap();
+            let region = mem.find_region(GuestAddress(0)).unwrap();
+            let bitmap = region.bitmap().as_ref().unwrap();
+            bitmap.get_and_reset();
+            remove_range(&mem, (GuestAddress(page as u64), page as u64), restored).unwrap();
+            assert!(!bitmap.dirty_at(0));
+            assert!(bitmap.dirty_at(page));
+            assert!(!bitmap.dirty_at(2 * page));
+            let mut data = vec![0; page];
+            mem.read(&mut data, GuestAddress(page as u64)).unwrap();
+            assert_eq!(data, vec![0; page]);
+            // Invalid ranges do not mutate memory or mark out-of-range bits.
+            assert!(remove_range(&mem, (GuestAddress(1), u64::MAX), restored).is_err());
+            assert!(remove_range(&mem, (GuestAddress(0), 0), restored).is_err());
+            if restored {
+                bitmap.get_and_reset();
+                assert!(remove_range_with_advice(
+                    &mem, (GuestAddress(0), page as u64), true, |_, _| -1,
+                ).is_err());
+                assert!(
+                    bitmap.dirty_at(0),
+                    "successful mmap must survive later madvise failure"
+                );
+                mem.read(&mut data, GuestAddress(0)).unwrap();
+                assert_eq!(data, vec![0; page]);
+            }
+        }
     }
 
     /// -------------------------------------

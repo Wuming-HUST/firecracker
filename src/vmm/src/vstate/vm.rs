@@ -11,7 +11,7 @@ use std::io::Write;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use kvm_bindings::{kvm_userspace_memory_region, KVM_MEM_LOG_DIRTY_PAGES};
+use kvm_bindings::{KVM_MEM_LOG_DIRTY_PAGES, kvm_userspace_memory_region};
 use kvm_ioctls::VmFd;
 use serde::{Deserialize, Serialize};
 use vmm_sys_util::eventfd::EventFd;
@@ -27,7 +27,7 @@ use crate::vstate::memory::{
     GuestRegionMmap,
 };
 use crate::vstate::vcpu::VcpuError;
-use crate::{mem_size_mib, DirtyBitmap, Vcpu};
+use crate::{DirtyBitmap, Vcpu, mem_size_mib};
 
 /// Architecture independent parts of a VM.
 #[derive(Debug)]
@@ -363,7 +363,7 @@ impl Vm {
         &self,
     ) -> Result<(DirtyBitmap, crate::utils::dirty_tracking::DirtyStats), vmm_sys_util::errno::Error>
     {
-        use crate::utils::dirty_tracking::{or_words, DirtyStats};
+        use crate::utils::dirty_tracking::{DirtyStats, harvest_slot, or_words};
         use crate::vstate::hdbss::{self, ExportPolicy};
         use std::time::Instant;
         let mut stats = DirtyStats::default();
@@ -377,13 +377,11 @@ impl Vm {
                 .expect("dirty ledger poisoned");
             for (slot, region) in self.guest_memory().iter().enumerate() {
                 let start = Instant::now();
-                let dirty = self.fd().get_dirty_log(slot as u32, region.size())?;
+                let saved = harvest_slot(&mut ledger, slot as u32, || {
+                    self.fd().get_dirty_log(slot as u32, region.size())
+                })?;
                 stats.kvm_collect_ns += start.elapsed().as_nanos() as u64;
                 stats.kvm_ioctls += 1;
-                let saved = ledger
-                    .entry(slot as u32)
-                    .or_insert_with(|| vec![0; dirty.len()]);
-                or_words(saved, &dirty);
                 let start = Instant::now();
                 if hdbss::export_policy() == ExportPolicy::Hybrid {
                     for page in 0..region.size().div_ceil(host_page_size()) {
@@ -531,8 +529,8 @@ pub fn mincore_bitmap(addr: *mut u8, len: usize, page_size: usize) -> Result<Vec
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use vm_memory::mmap::MmapRegionBuilder;
     use vm_memory::GuestAddress;
+    use vm_memory::mmap::MmapRegionBuilder;
 
     use super::*;
     use crate::test_utils::single_region_mem_raw;

@@ -3,7 +3,7 @@
 use std::fmt::{self, Display, Formatter};
 
 use crate::vstate::vm::GuestMemoryRegionMapping;
-use serde::{ser, Serialize};
+use serde::{Serialize, ser};
 
 /// Enumerates microVM runtime states.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -72,6 +72,18 @@ pub struct MemoryResponse {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct MemoryDirty {
     /// Bitmap for dirty pages. The bitmap is encoded as a vector of u64 values.
-    /// Each bit represents whether a page has been written since the last snapshot.
+    /// With tracking_version 1 this accumulates changes since this VM restore.
     pub bitmap: Vec<u64>,
+    /// Version 1 is cumulative KVM/VMM tracking since this restore.
+    pub tracking_version: u32,
+    /// Selection policy, independent of residency.
+    pub tracking_mode: String,
+    /// True only with logging and software bitmaps on every RAM region.
+    pub tracking_complete: bool,
+    /// A successful state-only snapshot has frozen CPU and device writers.
+    pub capture_ready: bool,
+    /// Bytes in the logical RAM stream, excluding GPA holes.
+    pub logical_size: u64,
+    /// Granularity of bitmap bits, in bytes.
+    pub page_size: u64,
 }

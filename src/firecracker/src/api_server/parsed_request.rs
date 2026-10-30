@@ -621,7 +621,10 @@ pub mod tests {
             },
         ));
         verify_ok_response_with(VmmData::MemoryDirty(
-            vmm::vmm_config::instance_info::MemoryDirty { bitmap: vec![] },
+            vmm::vmm_config::instance_info::MemoryDirty {
+                bitmap: vec![],
+                ..Default::default()
+            },
         ));
         verify_ok_response_with(VmmData::VmmVersion(String::default()));
 

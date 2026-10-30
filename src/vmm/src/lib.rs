@@ -140,12 +140,12 @@ use crate::device_manager::legacy::PortIODeviceManager;
 use crate::device_manager::mmio::MMIODeviceManager;
 use crate::devices::legacy::{IER_RDA_BIT, IER_RDA_OFFSET};
 use crate::devices::virtio::balloon::{
-    Balloon, BalloonConfig, BalloonError, BalloonStats, BALLOON_DEV_ID,
+    BALLOON_DEV_ID, Balloon, BalloonConfig, BalloonError, BalloonStats,
 };
 use crate::devices::virtio::block::device::Block;
 use crate::devices::virtio::net::Net;
 use crate::devices::virtio::{TYPE_BALLOON, TYPE_BLOCK, TYPE_NET};
-use crate::logger::{error, info, warn, MetricsError, METRICS};
+use crate::logger::{METRICS, MetricsError, error, info, warn};
 use crate::persist::{MicrovmState, MicrovmStateError, VmInfo};
 use crate::rate_limiter::BucketUpdate;
 use crate::snapshot::Persist;
@@ -305,6 +305,8 @@ pub struct Vmm {
     /// The [`InstanceInfo`] state of this [`Vmm`].
     pub instance_info: InstanceInfo,
     shutdown_exit_code: Option<FcExitCode>,
+    // True only after a successful state-only save froze all RAM writers.
+    external_capture_ready: bool,
 
     // Guest VM core resources.
     kvm: Kvm,
@@ -399,6 +401,7 @@ impl Vmm {
 
     /// Sends a resume command to the vCPUs.
     pub fn resume_vm(&mut self) -> Result<(), VmmError> {
+        self.external_capture_ready = false;
         self.mmio_device_manager
             .freeze_external_snapshot_devices(false);
         self.mmio_device_manager.kick_devices();
@@ -768,10 +771,11 @@ impl Vmm {
     /// Get dirty pages bitmap for guest memory.
     ///
     /// Returns a bitmap (Vec<u64>) where each bit corresponds to a guest page of `page_size`.
-    /// A set bit indicates the page is present in RAM and has been written to (not write-protected).
+    /// Bitmap policy includes cumulative KVM/VMM changes regardless of residency.
+    /// Other policies retain the legacy resident/pagemap selection as a supplement.
     /// Pages are ordered in the same order as reported by `/memory/mappings`.
     pub fn get_dirty_memory(&self, page_size: usize) -> Result<Vec<u64>, VmmError> {
-        use crate::utils::dirty_tracking::{mask_tail, or_words, DirtyStats};
+        use crate::utils::dirty_tracking::{DirtyStats, append_bitmap, mask_tail, or_words};
         use crate::vstate::hdbss::{self, ExportPolicy};
         use std::time::Instant;
         let start = Instant::now();
@@ -805,6 +809,7 @@ impl Vmm {
             Some(utils::pagemap::PagemapReader::new(page_size)?)
         };
         let mut dirty_bitmap = vec![];
+        let mut logical_pages = 0;
         for (slot, region) in self.vm.guest_memory().iter().enumerate() {
             let base_addr = region.as_ptr() as usize;
             let len = region.size() as usize;
@@ -850,7 +855,8 @@ impl Vmm {
                 .iter()
                 .map(|x| x.count_ones() as u64)
                 .sum::<u64>();
-            dirty_bitmap.extend_from_slice(&slot_bitmap);
+            append_bitmap(&mut dirty_bitmap, logical_pages, &slot_bitmap, nr_pages);
+            logical_pages += nr_pages;
         }
         stats.total_ns = start.elapsed().as_nanos() as u64;
         info!("DIRTY_STATS {}", serde_json::to_string(&stats).unwrap());

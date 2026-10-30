@@ -40,9 +40,59 @@ pub fn mask_tail(words: &mut [u64], pages: usize) {
     }
 }
 
+/// Harvest a slot into the durable-in-process ledger before another ioctl can fail.
+pub fn harvest_slot<E>(
+    ledger: &mut std::collections::HashMap<u32, Vec<u64>>,
+    slot: u32,
+    collect: impl FnOnce() -> Result<Vec<u64>, E>,
+) -> Result<&mut Vec<u64>, E> {
+    let dirty = collect()?;
+    let saved = ledger.entry(slot).or_insert_with(|| vec![0; dirty.len()]);
+    or_words(saved, &dirty);
+    Ok(saved)
+}
+
+/// Append region bits without introducing padding between logical RAM regions.
+pub fn append_bitmap(dst: &mut Vec<u64>, offset: usize, src: &[u64], pages: usize) {
+    dst.resize((offset + pages).div_ceil(64), 0);
+    let shift = offset % 64;
+    for (i, &word) in src.iter().enumerate() {
+        let index = offset / 64 + i;
+        if index < dst.len() {
+            dst[index] |= word << shift;
+        }
+        if shift != 0 && index + 1 < dst.len() {
+            dst[index + 1] |= word >> (64 - shift);
+        }
+    }
+    mask_tail(dst, offset + pages);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn failed_later_slot_and_retry_preserve_harvested_bits() {
+        let mut ledger = std::collections::HashMap::new();
+        harvest_slot(&mut ledger, 0, || Ok::<_, &'static str>(vec![1])).unwrap();
+        assert!(harvest_slot(&mut ledger, 1, || Err("ioctl failed")).is_err());
+        assert_eq!(ledger.get(&0), Some(&vec![1]));
+        assert!(!ledger.contains_key(&1));
+        harvest_slot(&mut ledger, 0, || Ok::<_, &'static str>(vec![4])).unwrap();
+        harvest_slot(&mut ledger, 1, || Ok::<_, &'static str>(vec![2])).unwrap();
+        assert_eq!(ledger.get(&0), Some(&vec![5]));
+        assert_eq!(ledger.get(&1), Some(&vec![2]));
+    }
+
+    #[test]
+    fn flatten_regions_without_word_padding() {
+        let mut bits = vec![];
+        append_bitmap(&mut bits, 0, &[1], 1);
+        append_bitmap(&mut bits, 1, &[u64::MAX, 1], 65);
+        append_bitmap(&mut bits, 66, &[1], 1);
+        assert_eq!(bits, vec![u64::MAX, 7]);
+    }
+
     #[test]
     fn merge_preserves_rewrites_and_tail() {
         let mut a = vec![1, 2, u64::MAX];
