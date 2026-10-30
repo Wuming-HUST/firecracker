@@ -506,6 +506,9 @@ impl Vmm {
     /// Saves the state of a paused Microvm.
     pub fn save_state(&mut self, vm_info: &VmInfo) -> Result<MicrovmState, MicrovmStateError> {
         use self::MicrovmStateError::SaveVmState;
+        self.mmio_device_manager
+            .prepare_save_devices()
+            .map_err(MicrovmStateError::SaveDevices)?;
         let vcpu_states = self.save_vcpu_states()?;
         let kvm_state = self.kvm.save_state();
         let vm_state = {

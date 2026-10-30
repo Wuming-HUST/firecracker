@@ -27,14 +27,14 @@ use vmm_sys_util::eventfd::EventFd;
 
 use super::super::super::DeviceError;
 use super::defs::uapi;
-use super::packet::{VSOCK_PKT_HDR_SIZE, VsockPacketRx, VsockPacketTx};
-use super::{VsockBackend, defs};
-use crate::devices::virtio::ActivateError;
+use super::packet::{VsockPacketRx, VsockPacketTx, VSOCK_PKT_HDR_SIZE};
+use super::{defs, VsockBackend};
 use crate::devices::virtio::device::{DeviceState, IrqTrigger, IrqType, VirtioDevice};
 use crate::devices::virtio::generated::virtio_config::{VIRTIO_F_IN_ORDER, VIRTIO_F_VERSION_1};
 use crate::devices::virtio::queue::Queue as VirtQueue;
-use crate::devices::virtio::vsock::VsockError;
 use crate::devices::virtio::vsock::metrics::METRICS;
+use crate::devices::virtio::vsock::VsockError;
+use crate::devices::virtio::ActivateError;
 use crate::logger::IncMetric;
 use crate::utils::byte_order;
 use crate::vstate::memory::{Bytes, GuestMemoryMmap};
@@ -70,6 +70,8 @@ pub struct Vsock<B> {
     pub(crate) activate_evt: EventFd,
     pub(crate) device_state: DeviceState,
     pub(crate) external_snapshot_frozen: bool,
+    /// Runtime-only idempotency for repeated state/RAM captures while paused.
+    pub(crate) checkpoint_reset_sent: bool,
 
     pub rx_packet: VsockPacketRx,
     pub tx_packet: VsockPacketTx,
@@ -107,6 +109,7 @@ where
             activate_evt: EventFd::new(libc::EFD_NONBLOCK).map_err(VsockError::EventFd)?,
             device_state: DeviceState::Inactive,
             external_snapshot_frozen: false,
+            checkpoint_reset_sent: false,
             rx_packet: VsockPacketRx::new()?,
             tx_packet: VsockPacketTx::default(),
         })
@@ -237,6 +240,22 @@ where
         have_used
     }
 
+    /// Finish reset notification before capturing interrupt-controller state.
+    pub fn prepare_snapshot(&mut self) -> Result<(), DeviceError> {
+        if matches!(self.device_state, DeviceState::Activated(_)) && !self.checkpoint_reset_sent {
+            self.send_transport_reset_event()?;
+            self.checkpoint_reset_sent = true;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn set_external_snapshot_frozen(&mut self, frozen: bool) {
+        self.external_snapshot_frozen = frozen;
+        if !frozen {
+            self.checkpoint_reset_sent = false;
+        }
+    }
+
     // Send TRANSPORT_RESET_EVENT to driver. According to specs, the driver shuts down established
     // connections and the guest_cid configuration field is fetched again. Existing listen sockets
     // remain but their CID is updated to reflect the current guest_cid.
@@ -251,11 +270,11 @@ where
         })?;
 
         mem.write_obj::<u32>(VIRTIO_VSOCK_EVENT_TRANSPORT_RESET, head.addr)
-            .unwrap_or_else(|err| error!("Failed to write virtio vsock reset event: {:?}", err));
+            .map_err(|_| DeviceError::MalformedDescriptor)?;
 
-        queue.add_used(head.index, head.len).unwrap_or_else(|err| {
-            error!("Failed to add used descriptor {}: {}", head.index, err);
-        });
+        queue
+            .add_used(head.index, head.len)
+            .map_err(DeviceError::QueueError)?;
         queue.advance_used_ring_idx();
 
         self.signal_used_queue()?;
@@ -363,6 +382,57 @@ mod tests {
     use super::*;
     use crate::devices::virtio::vsock::defs::uapi;
     use crate::devices::virtio::vsock::test_utils::TestContext;
+
+    #[test]
+    fn test_checkpoint_vsock_reset_is_idempotent_until_resume() {
+        use crate::devices::virtio::queue::VIRTQ_DESC_F_WRITE;
+        use crate::vstate::memory::GuestAddress;
+        let ctx = TestContext::new();
+        let mut handler = ctx.create_event_handler_context();
+        handler.guest_evvq.dtable[0].set(0x500000, 4, VIRTQ_DESC_F_WRITE, 0);
+        handler.guest_evvq.avail.ring[0].set(0);
+        handler.guest_evvq.avail.idx.set(1);
+        handler.device.activate(ctx.mem.clone()).unwrap();
+        handler.device.set_external_snapshot_frozen(true);
+        handler.device.prepare_snapshot().unwrap();
+        assert_eq!(handler.guest_evvq.used.idx.get(), 1);
+        assert_eq!(ctx.mem.read_obj::<u32>(GuestAddress(0x500000)).unwrap(), 0);
+        assert!(handler.device.irq_trigger.has_pending_irq(IrqType::Vring));
+        handler.device.prepare_snapshot().unwrap();
+        assert_eq!(handler.guest_evvq.used.idx.get(), 1);
+        handler.device.set_external_snapshot_frozen(false);
+        assert!(!handler.device.checkpoint_reset_sent);
+        handler.guest_evvq.avail.ring[1].set(0);
+        handler.guest_evvq.avail.idx.set(2);
+        handler.device.prepare_snapshot().unwrap();
+        assert_eq!(handler.guest_evvq.used.idx.get(), 2);
+    }
+
+    #[test]
+    fn test_checkpoint_vsock_empty_queue_never_becomes_success() {
+        let ctx = TestContext::new();
+        let mut handler = ctx.create_event_handler_context();
+        handler.device.activate(ctx.mem.clone()).unwrap();
+        assert!(handler.device.prepare_snapshot().is_err());
+        assert!(!handler.device.checkpoint_reset_sent);
+        assert!(handler.device.prepare_snapshot().is_err());
+        assert_eq!(handler.guest_evvq.used.idx.get(), 0);
+    }
+
+    #[test]
+    fn test_checkpoint_vsock_write_failure_is_not_published() {
+        use crate::devices::virtio::queue::VIRTQ_DESC_F_WRITE;
+        let ctx = TestContext::new();
+        let mut handler = ctx.create_event_handler_context();
+        // Descriptor covers one valid byte, but the reset event needs four.
+        handler.guest_evvq.dtable[0].set((ctx.mem_size - 1) as u64, 1, VIRTQ_DESC_F_WRITE, 0);
+        handler.guest_evvq.avail.ring[0].set(0);
+        handler.guest_evvq.avail.idx.set(1);
+        handler.device.activate(ctx.mem.clone()).unwrap();
+        assert!(handler.device.prepare_snapshot().is_err());
+        assert!(!handler.device.checkpoint_reset_sent);
+        assert_eq!(handler.guest_evvq.used.idx.get(), 0);
+    }
 
     #[test]
     fn test_virtio_device() {

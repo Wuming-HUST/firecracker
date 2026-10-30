@@ -4,10 +4,10 @@
 use event_manager::{EventOps, Events, MutEventSubscriber};
 use vmm_sys_util::eventfd::EventFd;
 
-use super::BlockError;
 use super::persist::{BlockConstructorArgs, BlockState};
 use super::vhost_user::device::{VhostUserBlock, VhostUserBlockConfig};
 use super::virtio::device::{VirtioBlock, VirtioBlockConfig};
+use super::BlockError;
 use crate::devices::virtio::device::{IrqTrigger, VirtioDevice};
 use crate::devices::virtio::queue::Queue;
 use crate::devices::virtio::{ActivateError, TYPE_BLOCK};
@@ -76,10 +76,10 @@ impl Block {
         }
     }
 
-    pub fn prepare_save(&mut self) {
+    pub fn prepare_save(&mut self) -> Result<(), BlockError> {
         match self {
-            Self::Virtio(b) => b.prepare_save(),
-            Self::VhostUser(b) => b.prepare_save(),
+            Self::Virtio(b) => b.prepare_save().map_err(BlockError::VirtioBackend),
+            Self::VhostUser(_) => Err(BlockError::InvalidBlockBackend),
         }
     }
 

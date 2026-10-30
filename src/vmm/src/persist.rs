@@ -22,9 +22,9 @@ use crate::arch::aarch64::vcpu::get_manufacturer_id_from_host;
 use crate::builder::{self, BuildMicrovmFromSnapshotError};
 use crate::cpu_config::templates::StaticCpuTemplate;
 #[cfg(target_arch = "x86_64")]
-use crate::cpu_config::x86_64::cpuid::CpuidTrait;
-#[cfg(target_arch = "x86_64")]
 use crate::cpu_config::x86_64::cpuid::common::get_vendor_id_from_host;
+#[cfg(target_arch = "x86_64")]
+use crate::cpu_config::x86_64::cpuid::CpuidTrait;
 use crate::device_manager::persist::{ACPIDeviceManagerState, DevicePersistError, DeviceStates};
 use crate::logger::{info, warn};
 use crate::resources::VmResources;
@@ -40,7 +40,7 @@ use crate::vstate::memory;
 use crate::vstate::memory::{GuestMemoryState, GuestRegionMmap, MemoryError};
 use crate::vstate::vcpu::{VcpuSendEventError, VcpuState};
 use crate::vstate::vm::VmState;
-use crate::{EventManager, Vmm, vstate};
+use crate::{vstate, EventManager, Vmm};
 
 /// Holds information related to the VM that is not part of VmState.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
@@ -119,6 +119,8 @@ pub enum MicrovmStateError {
     NotAllowed(String),
     /// Cannot restore devices: {0}
     RestoreDevices(DevicePersistError),
+    /// Cannot prepare devices for a consistent checkpoint: {0}
+    SaveDevices(DevicePersistError),
     /// Cannot save Vcpu state: {0}
     SaveVcpuState(vstate::vcpu::VcpuError),
     /// Cannot save Vm state: {0}
@@ -621,12 +623,11 @@ mod tests {
     use vmm_sys_util::tempfile::TempFile;
 
     use super::*;
-    use crate::Vmm;
     #[cfg(target_arch = "x86_64")]
     use crate::builder::tests::insert_vmgenid_device;
     use crate::builder::tests::{
-        CustomBlockConfig, default_kernel_cmdline, default_vmm, insert_balloon_device,
-        insert_block_devices, insert_net_device, insert_vsock_device,
+        default_kernel_cmdline, default_vmm, insert_balloon_device, insert_block_devices,
+        insert_net_device, insert_vsock_device, CustomBlockConfig,
     };
     #[cfg(target_arch = "aarch64")]
     use crate::construct_kvm_mpidrs;
@@ -636,6 +637,119 @@ mod tests {
     use crate::vmm_config::net::NetworkInterfaceConfig;
     use crate::vmm_config::vsock::tests::default_config;
     use crate::vstate::memory::GuestMemoryRegionState;
+    use crate::Vmm;
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn test_checkpoint_captures_async_block_completion_before_gic() {
+        use std::sync::{Arc, Mutex};
+
+        use crate::devices::virtio::block::device::Block;
+        use crate::devices::virtio::block::virtio::device::FileEngineType;
+        use crate::devices::virtio::block::virtio::test_utils::{
+            default_block_with_path, read_blk_req_descriptors, set_queue,
+        };
+        use crate::devices::virtio::device::VirtioDevice;
+        use crate::devices::virtio::mmio::MmioTransport;
+        use crate::devices::virtio::test_utils::{default_mem, VirtQueue};
+        use crate::vstate::memory::{Bytes, GuestAddress};
+
+        let disk = TempFile::new().unwrap();
+        disk.as_file().set_len(4096).unwrap();
+        std::os::unix::fs::FileExt::write_at(disk.as_file(), &[0x7a; 4096], 0).unwrap();
+        let mut vmm = default_vmm();
+        let mem = default_mem();
+        let vq = VirtQueue::new(GuestAddress(0), &mem, 16);
+        let mut block = default_block_with_path(
+            disk.as_path().to_str().unwrap().to_string(),
+            FileEngineType::Async,
+        );
+        set_queue(&mut block, 0, vq.create_queue());
+        read_blk_req_descriptors(&vq);
+        block.activate(mem.clone()).unwrap();
+        let block = Arc::new(Mutex::new(Block::Virtio(block)));
+        let mut cmdline = default_kernel_cmdline();
+        vmm.mmio_device_manager
+            .register_mmio_virtio_for_boot(
+                vmm.vm.fd(),
+                &mut vmm.resource_allocator,
+                "async-checkpoint".to_string(),
+                MmioTransport::new(mem.clone(), block.clone(), false),
+                &mut cmdline,
+            )
+            .unwrap();
+        let before = vmm.vm.save_state(&[]).unwrap();
+        block.lock().unwrap().process_virtio_queues();
+        assert_eq!(vq.used.idx.get(), 0, "completion must still be pending");
+
+        let state = vmm.save_state(&VmInfo::default()).unwrap();
+        assert_eq!(vq.used.idx.get(), 1);
+        let mut data = [0; 4096];
+        mem.read_slice(&mut data, GuestAddress(0x2000)).unwrap();
+        assert_eq!(data, [0x7a; 4096]);
+        // GIC distributor IRQ state must include the completion that updated
+        // the used ring and read buffer. Capturing GIC first loses this IRQ on
+        // restore even though block/RAM serialization contains the completion.
+        let chunks = |state: &crate::arch::aarch64::gic::GicState| {
+            state
+                .dist
+                .iter()
+                .map(|r| r.chunks.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_ne!(chunks(&state.vm_state.gic), chunks(&before.gic));
+        assert_eq!(
+            chunks(&state.vm_state.gic),
+            chunks(&vmm.vm.save_state(&[]).unwrap().gic),
+            "captured GIC must match the post-drain interrupt boundary"
+        );
+    }
+
+    #[test]
+    fn test_checkpoint_flush_failure_publishes_no_state_or_ram() {
+        use crate::devices::virtio::block::device::Block;
+        use crate::devices::virtio::block::virtio::device::FileEngineType;
+        use crate::devices::virtio::block::virtio::test_utils::default_block_with_path;
+        use crate::devices::virtio::device::VirtioDevice;
+        use crate::devices::virtio::mmio::MmioTransport;
+        use crate::devices::virtio::test_utils::default_mem;
+        use std::sync::{Arc, Mutex};
+        for native in [false, true] {
+            let mut vmm = default_vmm();
+            let mem = default_mem();
+            // /dev/null supports the fixture's open/seek but rejects fsync with
+            // EINVAL, so this exercises a real flush error without mocking it.
+            let mut block = default_block_with_path("/dev/null".to_string(), FileEngineType::Sync);
+            block.activate(mem.clone()).unwrap();
+            let mut cmdline = default_kernel_cmdline();
+            vmm.mmio_device_manager
+                .register_mmio_virtio_for_boot(
+                    vmm.vm.fd(),
+                    &mut vmm.resource_allocator,
+                    "bad-flush".to_string(),
+                    MmioTransport::new(mem, Arc::new(Mutex::new(Block::Virtio(block))), false),
+                    &mut cmdline,
+                )
+                .unwrap();
+            let mut state = TempFile::new().unwrap();
+            state.remove().unwrap();
+            let mut ram = TempFile::new().unwrap();
+            ram.remove().unwrap();
+            let params = CreateSnapshotParams {
+                snapshot_type: Default::default(),
+                snapshot_path: state.as_path().to_path_buf(),
+                mem_file_path: native.then(|| ram.as_path().to_path_buf()),
+            };
+            assert!(matches!(
+                create_snapshot(&mut vmm, &VmInfo::default(), &params),
+                Err(CreateSnapshotError::MicrovmState(
+                    MicrovmStateError::SaveDevices(_)
+                ))
+            ));
+            assert!(!state.as_path().exists());
+            assert!(!ram.as_path().exists());
+        }
+    }
 
     fn default_vmm_with_devices() -> Vmm {
         let mut event_manager = EventManager::new().expect("Cannot create EventManager");

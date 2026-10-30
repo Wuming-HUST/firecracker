@@ -8,38 +8,37 @@ use std::sync::{Arc, Mutex};
 
 use event_manager::{MutEventSubscriber, SubscriberOps};
 use kvm_ioctls::VmFd;
-use log::{error, warn};
+use log::warn;
 use serde::{Deserialize, Serialize};
 use vm_allocator::AllocPolicy;
 
 use super::acpi::ACPIDeviceManager;
 use super::mmio::*;
 use super::resources::ResourceAllocator;
-use crate::EventManager;
 #[cfg(target_arch = "aarch64")]
 use crate::arch::DeviceType;
 use crate::devices::acpi::vmgenid::{VMGenIDState, VMGenIdConstructorArgs, VmGenId, VmGenIdError};
 use crate::devices::virtio::balloon::persist::{BalloonConstructorArgs, BalloonState};
 use crate::devices::virtio::balloon::{Balloon, BalloonError};
-use crate::devices::virtio::block::BlockError;
 use crate::devices::virtio::block::device::Block;
 use crate::devices::virtio::block::persist::{BlockConstructorArgs, BlockState};
+use crate::devices::virtio::block::BlockError;
 use crate::devices::virtio::device::VirtioDevice;
 use crate::devices::virtio::mmio::MmioTransport;
-use crate::devices::virtio::net::Net;
 use crate::devices::virtio::net::persist::{
     NetConstructorArgs, NetPersistError as NetError, NetState,
 };
+use crate::devices::virtio::net::Net;
 use crate::devices::virtio::persist::{MmioTransportConstructorArgs, MmioTransportState};
-use crate::devices::virtio::rng::Entropy;
 use crate::devices::virtio::rng::persist::{
     EntropyConstructorArgs, EntropyPersistError as EntropyError, EntropyState,
 };
+use crate::devices::virtio::rng::Entropy;
 use crate::devices::virtio::vsock::persist::{
     VsockConstructorArgs, VsockState, VsockUdsConstructorArgs,
 };
 use crate::devices::virtio::vsock::{
-    TYPE_VSOCK, Vsock, VsockError, VsockUnixBackend, VsockUnixBackendError,
+    Vsock, VsockError, VsockUnixBackend, VsockUnixBackendError, TYPE_VSOCK,
 };
 use crate::devices::virtio::{TYPE_BALLOON, TYPE_BLOCK, TYPE_NET, TYPE_RNG};
 use crate::mmds::data_store::MmdsVersion;
@@ -47,6 +46,7 @@ use crate::resources::{ResourcesError, VmResources};
 use crate::snapshot::Persist;
 use crate::vmm_config::mmds::MmdsConfigError;
 use crate::vstate::memory::GuestMemoryMmap;
+use crate::EventManager;
 
 /// Errors for (de)serialization of the MMIO device manager.
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
@@ -66,6 +66,8 @@ pub enum DevicePersistError {
     Net(#[from] NetError),
     /// Vsock: {0}
     Vsock(#[from] VsockError),
+    /// Cannot prepare vsock checkpoint: {0}
+    PrepareVsock(crate::devices::DeviceError),
     /// VsockUnixBackend: {0}
     VsockUnixBackend(#[from] VsockUnixBackendError),
     /// MmdsConfig: {0}
@@ -350,7 +352,9 @@ impl<'a> Persist<'a> for MMIODeviceManager {
                              snapshotting yet"
                         );
                     } else {
-                        block.prepare_save();
+                        // Vmm::save_state drains completions before capturing
+                        // vCPU/GIC state. Serialization must not change RAM or
+                        // interrupt state after that checkpoint boundary.
                         states.block_devices.push(ConnectedBlockState {
                             device_id: devid.clone(),
                             device_state: block.save(),
@@ -382,14 +386,7 @@ impl<'a> Persist<'a> for MMIODeviceManager {
                         .downcast_mut::<Vsock<VsockUnixBackend>>()
                         .unwrap();
 
-                    // Send Transport event to reset connections if device
-                    // is activated.
-                    if vsock.is_activated() {
-                        vsock.send_transport_reset_event().unwrap_or_else(|err| {
-                            error!("Failed to send reset transport event: {:?}", err);
-                        });
-                    }
-
+                    // Transport reset was prepared before vCPU/GIC capture.
                     // Save state after potential notification to the guest. This
                     // way we save changes to the queue the notification can cause.
                     let vsock_state = VsockState {
