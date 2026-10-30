@@ -54,7 +54,10 @@ impl Balloon {
                 Self::PROCESS_VIRTQ_REPORTING,
                 EventSet::IN,
             )) {
-                error!("Failed to register free page reporting queue event: {}", err);
+                error!(
+                    "Failed to register free page reporting queue event: {}",
+                    err
+                );
             }
         }
     }
@@ -86,6 +89,11 @@ impl Balloon {
 
 impl MutEventSubscriber for Balloon {
     fn process(&mut self, event: Events, ops: &mut EventOps) {
+        // Keep pending eventfds intact until resume_vm kicks the devices.
+        // API state save and external RAM export span several event-loop turns.
+        if self.external_snapshot_frozen {
+            return;
+        }
         let source = event.data();
         let event_set = event.event_set();
         let supported_events = EventSet::IN;
@@ -150,7 +158,48 @@ pub mod tests {
     use super::*;
     use crate::devices::virtio::balloon::test_utils::set_request;
     use crate::devices::virtio::test_utils::{VirtQueue, default_mem};
-    use crate::vstate::memory::GuestAddress;
+    use crate::vstate::memory::{Bytes, GuestAddress};
+
+    #[test]
+    fn test_external_snapshot_freeze_preserves_reporting_event_and_ram() {
+        let page_size = crate::utils::get_page_size().unwrap();
+        let mem = crate::test_utils::single_region_mem(4 * page_size);
+        let mut balloon = Balloon::new(0, true, 0, true, false).unwrap();
+        let index = balloon.free_page_reporting_idx();
+        let queue = VirtQueue::new(GuestAddress(0), &mem, 16);
+        balloon.set_queue(index, queue.create_queue());
+        balloon.activate(mem.clone()).unwrap();
+        let page = GuestAddress(page_size as u64);
+        let original = vec![0xa5; page_size];
+        mem.write_slice(&original, page).unwrap();
+        set_request(&queue, 0, page_size as u64, page_size as u32, 0);
+        balloon.external_snapshot_frozen = true;
+        balloon.queue_evts[index].write(1).unwrap();
+        let balloon = Arc::new(Mutex::new(balloon));
+        let mut manager = EventManager::new().unwrap();
+        manager.add_subscriber(balloon.clone());
+
+        // A level-triggered event must remain pending over successive event-loop
+        // turns while external RAM export is in progress. In particular FPR may
+        // neither zero the reported page nor advance the used ring.
+        for _ in 0..2 {
+            assert_eq!(manager.run_with_timeout(0).unwrap(), 1);
+            assert_eq!(queue.used.idx.get(), 0);
+            let mut observed = vec![0; page_size];
+            mem.read_slice(&mut observed, page).unwrap();
+            assert_eq!(observed, original);
+        }
+
+        balloon.lock().unwrap().external_snapshot_frozen = false;
+        // No eventfd rewrite: successful processing proves the frozen handler
+        // preserved the original event as well as the descriptor and RAM.
+        assert_eq!(manager.run_with_timeout(50).unwrap(), 1);
+        assert_eq!(queue.used.idx.get(), 1);
+        let mut observed = vec![0xff; page_size];
+        mem.read_slice(&mut observed, page).unwrap();
+        assert_eq!(observed, vec![0; page_size]);
+        assert_eq!(manager.run_with_timeout(0).unwrap(), 0);
+    }
 
     #[test]
     fn test_event_handler() {

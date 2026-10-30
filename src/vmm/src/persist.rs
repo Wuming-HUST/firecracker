@@ -22,9 +22,9 @@ use crate::arch::aarch64::vcpu::get_manufacturer_id_from_host;
 use crate::builder::{self, BuildMicrovmFromSnapshotError};
 use crate::cpu_config::templates::StaticCpuTemplate;
 #[cfg(target_arch = "x86_64")]
-use crate::cpu_config::x86_64::cpuid::common::get_vendor_id_from_host;
-#[cfg(target_arch = "x86_64")]
 use crate::cpu_config::x86_64::cpuid::CpuidTrait;
+#[cfg(target_arch = "x86_64")]
+use crate::cpu_config::x86_64::cpuid::common::get_vendor_id_from_host;
 use crate::device_manager::persist::{ACPIDeviceManagerState, DevicePersistError, DeviceStates};
 use crate::logger::{info, warn};
 use crate::resources::VmResources;
@@ -40,7 +40,7 @@ use crate::vstate::memory;
 use crate::vstate::memory::{GuestMemoryState, GuestRegionMmap, MemoryError};
 use crate::vstate::vcpu::{VcpuSendEventError, VcpuState};
 use crate::vstate::vm::VmState;
-use crate::{vstate, EventManager, Vmm};
+use crate::{EventManager, Vmm, vstate};
 
 /// Holds information related to the VM that is not part of VmState.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
@@ -133,6 +133,8 @@ pub enum MicrovmStateError {
 #[rustfmt::skip]
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
 pub enum CreateSnapshotError {
+    /// External RAM export does not support out-of-process vhost-user writers.
+    UnsupportedExternalSnapshotDevice,
     /// Cannot get dirty bitmap: {0}
     DirtyBitmap(#[from] vmm_sys_util::errno::Error),
     /// Cannot write memory file: {0}
@@ -164,7 +166,10 @@ pub fn create_snapshot(
     // snapshot, its CPU/device state and RAM copy span multiple epoll iterations.
     // Stop net/block event handlers before saving either side of that boundary.
     // Block prepare_save below drains outstanding async IO before state is saved.
-    if vmm.vm.common.track_dirty_export && params.mem_file_path.is_none() {
+    if params.mem_file_path.is_none() {
+        if !vmm.mmio_device_manager.supports_external_snapshot() {
+            return Err(CreateSnapshotError::UnsupportedExternalSnapshotDevice);
+        }
         vmm.mmio_device_manager
             .freeze_external_snapshot_devices(true);
     }
@@ -616,11 +621,12 @@ mod tests {
     use vmm_sys_util::tempfile::TempFile;
 
     use super::*;
+    use crate::Vmm;
     #[cfg(target_arch = "x86_64")]
     use crate::builder::tests::insert_vmgenid_device;
     use crate::builder::tests::{
-        default_kernel_cmdline, default_vmm, insert_balloon_device, insert_block_devices,
-        insert_net_device, insert_vsock_device, CustomBlockConfig,
+        CustomBlockConfig, default_kernel_cmdline, default_vmm, insert_balloon_device,
+        insert_block_devices, insert_net_device, insert_vsock_device,
     };
     #[cfg(target_arch = "aarch64")]
     use crate::construct_kvm_mpidrs;
@@ -630,7 +636,6 @@ mod tests {
     use crate::vmm_config::net::NetworkInterfaceConfig;
     use crate::vmm_config::vsock::tests::default_config;
     use crate::vstate::memory::GuestMemoryRegionState;
-    use crate::Vmm;
 
     fn default_vmm_with_devices() -> Vmm {
         let mut event_manager = EventManager::new().expect("Cannot create EventManager");

@@ -178,6 +178,11 @@ where
     B: Debug + VsockBackend + 'static,
 {
     fn process(&mut self, event: Events, ops: &mut EventOps) {
+        // Keep pending eventfds intact until resume_vm kicks the devices.
+        // API state save and external RAM export span several event-loop turns.
+        if self.external_snapshot_frozen {
+            return;
+        }
         let source = event.data();
         let evset = event.event_set();
 
@@ -224,6 +229,54 @@ mod tests {
     use super::super::*;
     use super::*;
     use crate::devices::virtio::vsock::test_utils::{EventHandlerContext, TestContext};
+
+    #[test]
+    fn test_external_snapshot_freeze_preserves_tx_event_and_rx_ram() {
+        use crate::vstate::memory::{Bytes, GuestAddress};
+
+        let test_ctx = TestContext::new();
+        let mut ctx = test_ctx.create_event_handler_context();
+        ctx.mock_activate(test_ctx.mem.clone());
+        ctx.device.backend.set_pending_rx(true);
+        let payload_addr = GuestAddress(0x0040_1000);
+        let original = vec![0xa5; 4096];
+        test_ctx.mem.write_slice(&original, payload_addr).unwrap();
+        ctx.device.external_snapshot_frozen = true;
+        ctx.device.queue_events[TXQ_INDEX].write(1).unwrap();
+        let vsock = Arc::new(Mutex::new(ctx.device));
+        let mut manager = EventManager::new().unwrap();
+        manager.add_subscriber(vsock.clone());
+
+        for _ in 0..2 {
+            assert_eq!(manager.run_with_timeout(0).unwrap(), 1);
+            assert_eq!(ctx.guest_txvq.used.idx.get(), 0);
+            assert_eq!(ctx.guest_rxvq.used.idx.get(), 0);
+            let device = vsock.lock().unwrap();
+            assert_eq!(device.backend.tx_ok_cnt, 0);
+            assert_eq!(device.backend.rx_ok_cnt, 0);
+            let mut observed = vec![0; original.len()];
+            test_ctx
+                .mem
+                .read_slice(&mut observed, payload_addr)
+                .unwrap();
+            assert_eq!(observed, original);
+        }
+
+        vsock.lock().unwrap().external_snapshot_frozen = false;
+        assert_eq!(manager.run_with_timeout(50).unwrap(), 1);
+        assert_eq!(ctx.guest_txvq.used.idx.get(), 1);
+        assert_eq!(ctx.guest_rxvq.used.idx.get(), 1);
+        let device = vsock.lock().unwrap();
+        assert_eq!(device.backend.tx_ok_cnt, 1);
+        assert_eq!(device.backend.rx_ok_cnt, 1);
+        let mut observed = [0; 8];
+        test_ctx
+            .mem
+            .read_slice(&mut observed, payload_addr)
+            .unwrap();
+        assert_eq!(observed, [0xd, 0xe, 0xa, 0xd, 0xb, 0xe, 0xe, 0xf]);
+        assert_eq!(manager.run_with_timeout(0).unwrap(), 0);
+    }
 
     #[test]
     fn test_txq_event() {

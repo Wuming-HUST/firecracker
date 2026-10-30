@@ -45,6 +45,7 @@ pub struct Entropy {
 
     // Transport fields
     device_state: DeviceState,
+    pub(crate) external_snapshot_frozen: bool,
     pub(crate) queues: Vec<Queue>,
     queue_events: Vec<EventFd>,
     irq_trigger: IrqTrigger,
@@ -76,6 +77,7 @@ impl Entropy {
             acked_features: 0u64,
             activate_event,
             device_state: DeviceState::Inactive,
+            external_snapshot_frozen: false,
             queues,
             queue_events,
             irq_trigger,

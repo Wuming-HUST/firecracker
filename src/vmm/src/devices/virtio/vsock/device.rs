@@ -69,6 +69,7 @@ pub struct Vsock<B> {
     // continuous triggers from happening before the device gets activated.
     pub(crate) activate_evt: EventFd,
     pub(crate) device_state: DeviceState,
+    pub(crate) external_snapshot_frozen: bool,
 
     pub rx_packet: VsockPacketRx,
     pub tx_packet: VsockPacketTx,
@@ -105,6 +106,7 @@ where
             irq_trigger: IrqTrigger::new().map_err(VsockError::EventFd)?,
             activate_evt: EventFd::new(libc::EFD_NONBLOCK).map_err(VsockError::EventFd)?,
             device_state: DeviceState::Inactive,
+            external_snapshot_frozen: false,
             rx_packet: VsockPacketRx::new()?,
             tx_packet: VsockPacketTx::default(),
         })

@@ -167,6 +167,7 @@ pub struct Balloon {
 
     // Implementation specific fields.
     pub(crate) restored_from_file: bool,
+    pub(crate) external_snapshot_frozen: bool,
     pub(crate) stats_polling_interval_s: u16,
     pub(crate) stats_timer: TimerFd,
     // The index of the previous stats descriptor is saved because
@@ -260,6 +261,7 @@ impl Balloon {
             device_state: DeviceState::Inactive,
             activate_evt: EventFd::new(libc::EFD_NONBLOCK).map_err(BalloonError::EventFd)?,
             restored_from_file,
+            external_snapshot_frozen: false,
             stats_polling_interval_s,
             stats_timer,
             stats_desc_index: None,
@@ -330,9 +332,7 @@ impl Balloon {
                 last_desc = desc.next_descriptor();
             }
 
-            queue
-                .add_used(head_index, 0)
-                .map_err(BalloonError::Queue)?;
+            queue.add_used(head_index, 0).map_err(BalloonError::Queue)?;
             needs_interrupt = true;
         }
         queue.advance_used_ring_idx();
@@ -812,7 +812,8 @@ pub(crate) mod tests {
         // Test all feature combinations.
         for deflate_on_oom in [true, false].iter() {
             for stats_interval in [0, 1].iter() {
-                let mut balloon = Balloon::new(0, *deflate_on_oom, *stats_interval, false, false).unwrap();
+                let mut balloon =
+                    Balloon::new(0, *deflate_on_oom, *stats_interval, false, false).unwrap();
                 assert_eq!(balloon.device_type(), TYPE_BALLOON);
 
                 let features: u64 = (1u64 << VIRTIO_F_VERSION_1)
@@ -1226,7 +1227,10 @@ pub(crate) mod tests {
             assert_eq!(repq.used.idx.get(), 0);
             // The page is untouched.
             for i in 0..page_size {
-                assert_eq!(mem.read_obj::<u8>(GuestAddress(reported_addr + i)).unwrap(), 1);
+                assert_eq!(
+                    mem.read_obj::<u8>(GuestAddress(reported_addr + i)).unwrap(),
+                    1
+                );
             }
         }
 
@@ -1246,7 +1250,10 @@ pub(crate) mod tests {
 
             // The reported page has been released (zeroed).
             for i in 0..page_size {
-                assert_eq!(mem.read_obj::<u8>(GuestAddress(reported_addr + i)).unwrap(), 0);
+                assert_eq!(
+                    mem.read_obj::<u8>(GuestAddress(reported_addr + i)).unwrap(),
+                    0
+                );
             }
         }
     }
