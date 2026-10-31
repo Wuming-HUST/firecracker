@@ -109,6 +109,13 @@ impl TryFrom<&Request> for ParsedRequest {
             (Method::Put, "snapshot", Some(body)) => parse_put_snapshot(body, path_tokens.next()),
             (Method::Put, "vsock", Some(body)) => parse_put_vsock(body),
             (Method::Put, "entropy", Some(body)) => parse_put_entropy(body),
+            (Method::Put, "pmem", Some(body)) if path_tokens.next().is_none() => {
+                let config =
+                    serde_json::from_slice::<vmm::vmm_config::pmem::PmemConfig>(body.raw())?;
+                Ok(Self::new_sync(
+                    vmm::rpc_interface::VmmAction::SetPmemDevice(config),
+                ))
+            }
             (Method::Put, _, None) => method_to_error(Method::Put),
             (Method::Patch, "balloon", Some(body)) => parse_patch_balloon(body, path_tokens.next()),
             (Method::Patch, "drives", Some(body)) => parse_patch_drive(body, path_tokens.next()),
@@ -787,6 +794,21 @@ pub mod tests {
         connection.try_read().unwrap();
         let req = connection.pop_parsed_request().unwrap();
         ParsedRequest::try_from(&req).unwrap();
+    }
+
+    #[test]
+    fn test_pmem_preboot_request_and_exact_route() {
+        let body = r#"{"pmem_id":"lower","path_on_host":"/lower.raw","content_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","guest_address":274877906944,"size":134217728,"read_only":true}"#;
+        for (path, valid) in [("/pmem", true), ("/pmem/extra", false)] {
+            let (mut sender, receiver) = UnixStream::pair().unwrap();
+            let mut connection = HttpConnection::new(receiver);
+            sender
+                .write_all(http_request("PUT", path, Some(body)).as_bytes())
+                .unwrap();
+            connection.try_read().unwrap();
+            let req = connection.pop_parsed_request().unwrap();
+            assert_eq!(ParsedRequest::try_from(&req).is_ok(), valid);
+        }
     }
 
     #[test]

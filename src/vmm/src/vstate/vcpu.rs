@@ -533,6 +533,18 @@ fn handle_kvm_exit(
                 Ok(VcpuEmulation::Handled)
             }
             VcpuExit::MmioWrite(addr, data) => {
+                let end = addr
+                    .checked_add(data.len() as u64)
+                    .ok_or_else(|| VcpuError::FaultyKvmExit("MMIO address overflow".into()))?;
+                if peripherals
+                    .readonly_ranges
+                    .iter()
+                    .any(|r| addr < r.end && r.start < end)
+                {
+                    return Err(VcpuError::FaultyKvmExit(format!(
+                        "CPU write to immutable pmem GPA {addr:#x}"
+                    )));
+                }
                 if let Some(mmio_bus) = &peripherals.mmio_bus {
                     let _metric = METRICS.vcpu.exit_mmio_write_agg.record_latency_metrics();
                     mmio_bus.write(addr, data);

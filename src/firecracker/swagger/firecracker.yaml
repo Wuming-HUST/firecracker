@@ -485,6 +485,24 @@ paths:
           schema:
             $ref: "#/definitions/Error"
 
+  /pmem:
+    put:
+      summary: Configure a verified immutable virtio-pmem device. Pre-boot only.
+      operationId: putPmem
+      parameters:
+        - name: body
+          in: body
+          required: true
+          schema:
+            $ref: "#/definitions/PmemConfig"
+      responses:
+        204:
+          description: Immutable device configured
+        default:
+          description: Invalid binding, incompatible layout, or operation not supported
+          schema:
+            $ref: "#/definitions/Error"
+
   /entropy:
     put:
       summary: Creates an entropy device. Pre-boot only.
@@ -731,6 +749,40 @@ paths:
             $ref: "#/definitions/Error"
 
 definitions:
+  PmemConfig:
+    type: object
+    additionalProperties: false
+    description: Immutable full file identity and separate readonly GPA window. Host path is supplied anew on restore.
+    required: [pmem_id, path_on_host, content_id, guest_address, size, read_only]
+    properties:
+      pmem_id:
+        type: string
+        pattern: '^[A-Za-z0-9_-]{1,64}$'
+      path_on_host:
+        type: string
+      content_id:
+        type: string
+        pattern: '^[0-9a-f]{64}$'
+      guest_address:
+        type: integer
+        format: uint64
+        minimum: 4294967296
+        maximum: 1099377410048
+        multipleOf: 134217728
+      size:
+        type: integer
+        format: uint64
+        minimum: 134217728
+        multipleOf: 134217728
+      file_offset:
+        type: integer
+        format: uint64
+        default: 0
+        multipleOf: 4096
+      read_only:
+        type: boolean
+        enum: [true]
+
   Balloon:
     type: object
     required:
@@ -1323,6 +1375,10 @@ definitions:
     required:
       - snapshot_path
     properties:
+      pmem_override:
+        $ref: "#/definitions/PmemConfig"
+        description: Required node-local binding for a pmem snapshot; content and layout must match the saved state.
+
       enable_diff_snapshots:
         type: boolean
         description:

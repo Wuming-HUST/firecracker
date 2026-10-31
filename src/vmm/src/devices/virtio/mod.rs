@@ -21,6 +21,7 @@ pub mod iovec;
 pub mod mmio;
 pub mod net;
 pub mod persist;
+pub mod pmem;
 pub mod queue;
 pub mod rng;
 pub mod test_utils;

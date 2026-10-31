@@ -123,6 +123,8 @@ pub struct KvmVcpu {
 /// Vcpu peripherals
 #[derive(Default, Debug)]
 pub struct Peripherals {
+    /// Immutable device GPA ranges: CPU writes terminate this VM.
+    pub readonly_ranges: Vec<std::ops::Range<u64>>,
     /// mmio bus.
     pub mmio_bus: Option<crate::devices::Bus>,
 }

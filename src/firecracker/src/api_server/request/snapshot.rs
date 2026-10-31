@@ -106,6 +106,7 @@ fn parse_put_snapshot_load(body: &Body) -> Result<ParsedRequest, RequestError> {
         enable_diff_snapshots: snapshot_config.enable_diff_snapshots,
         resume_vm: snapshot_config.resume_vm,
         network_overrides: snapshot_config.network_overrides,
+        pmem_override: snapshot_config.pmem_override,
     };
 
     // Construct the `ParsedRequest` object.
@@ -175,6 +176,7 @@ mod tests {
             }
         }"#;
         let expected_config = LoadSnapshotParams {
+            pmem_override: None,
             snapshot_path: PathBuf::from("foo"),
             mem_backend: MemBackendConfig {
                 backend_path: PathBuf::from("bar"),
@@ -205,6 +207,7 @@ mod tests {
             "enable_diff_snapshots": true
         }"#;
         let expected_config = LoadSnapshotParams {
+            pmem_override: None,
             snapshot_path: PathBuf::from("foo"),
             mem_backend: MemBackendConfig {
                 backend_path: PathBuf::from("bar"),
@@ -235,6 +238,7 @@ mod tests {
             "resume_vm": true
         }"#;
         let expected_config = LoadSnapshotParams {
+            pmem_override: None,
             snapshot_path: PathBuf::from("foo"),
             mem_backend: MemBackendConfig {
                 backend_path: PathBuf::from("bar"),
@@ -271,6 +275,7 @@ mod tests {
             ]
         }"#;
         let expected_config = LoadSnapshotParams {
+            pmem_override: None,
             snapshot_path: PathBuf::from("foo"),
             mem_backend: MemBackendConfig {
                 backend_path: PathBuf::from("bar"),
@@ -301,6 +306,7 @@ mod tests {
             "resume_vm": true
         }"#;
         let expected_config = LoadSnapshotParams {
+            pmem_override: None,
             snapshot_path: PathBuf::from("foo"),
             mem_backend: MemBackendConfig {
                 backend_path: PathBuf::from("bar"),

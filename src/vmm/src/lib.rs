@@ -384,6 +384,7 @@ impl Vmm {
         self.vcpus_handles.reserve(vcpu_count);
 
         for mut vcpu in vcpus.drain(..) {
+            vcpu.kvm_vcpu.peripherals.readonly_ranges = self.vm.guest_memory().readonly_ranges();
             vcpu.set_mmio_bus(self.mmio_device_manager.bus.clone());
             #[cfg(target_arch = "x86_64")]
             vcpu.kvm_vcpu

@@ -35,6 +35,7 @@ pub struct VmCommon {
     /// The KVM file descriptor used to access this Vm.
     pub fd: VmFd,
     max_memslots: usize,
+    readonly_memory_supported: bool,
     /// The guest memory of this Vm.
     pub guest_memory: GuestMemoryMmap,
     /// Host-only HDBSS resources are recreated on restore.
@@ -126,6 +127,7 @@ impl Vm {
         Ok(VmCommon {
             fd,
             max_memslots: kvm.max_nr_memslots(),
+            readonly_memory_supported: kvm.fd.check_extension(kvm_ioctls::Cap::ReadonlyMem),
             guest_memory: GuestMemoryMmap::default(),
             hdbss_order: 0,
             track_dirty_export: false,
@@ -172,6 +174,11 @@ impl Vm {
 
     /// Register a new memory region to this [`Vm`].
     pub fn register_memory_region(&mut self, region: GuestRegionMmap) -> Result<(), VmError> {
+        if !self.common.guest_memory.readonly_ranges().is_empty() {
+            return Err(VmError::InvalidMemoryConfiguration(
+                "RAM slots must precede immutable device slots".into(),
+            ));
+        }
         let next_slot = self
             .guest_memory()
             .num_regions()
@@ -206,6 +213,56 @@ impl Vm {
 
         self.common.guest_memory = new_guest_memory;
 
+        Ok(())
+    }
+
+    /// Device windows have separate slots and never participate in RAM iteration,
+    /// dirty logging, snapshots, balloon/FPR, FDT memory nodes or E820 RAM.
+    pub fn register_readonly_memory_region(
+        &mut self,
+        region: Arc<GuestRegionMmap>,
+    ) -> Result<(), VmError> {
+        if !self.common.readonly_memory_supported {
+            return Err(VmError::InvalidMemoryConfiguration(
+                "KVM_CAP_READONLY_MEM is required".into(),
+            ));
+        }
+        let start = region.start_addr().0;
+        let end = start
+            .checked_add(region.len())
+            .ok_or_else(|| VmError::InvalidMemoryConfiguration("pmem GPA overflow".into()))?;
+        if self
+            .guest_memory()
+            .iter()
+            .any(|r| start <= r.last_addr().0 && r.start_addr().0 < end)
+            || self
+                .guest_memory()
+                .readonly_ranges()
+                .iter()
+                .any(|r| start < r.end && r.start < end)
+        {
+            return Err(VmError::InvalidMemoryConfiguration(
+                "pmem overlaps another memory region".into(),
+            ));
+        }
+        let slot = self.guest_memory().num_regions() + self.guest_memory().readonly_ranges().len();
+        if slot >= self.common.max_memslots {
+            return Err(VmError::NotEnoughMemorySlots);
+        }
+        let descriptor = kvm_userspace_memory_region {
+            slot: slot as u32,
+            guest_phys_addr: start,
+            memory_size: region.len(),
+            userspace_addr: region.as_ptr() as u64,
+            flags: kvm_bindings::KVM_MEM_READONLY,
+        };
+        // SAFETY: mapping is retained by the address space and is immutable.
+        unsafe {
+            self.fd()
+                .set_user_memory_region(descriptor)
+                .map_err(VmError::SetUserMemoryRegion)?;
+        }
+        self.common.guest_memory.add_readonly_region(region);
         Ok(())
     }
 

@@ -15,30 +15,31 @@ use vm_allocator::AllocPolicy;
 use super::acpi::ACPIDeviceManager;
 use super::mmio::*;
 use super::resources::ResourceAllocator;
+use crate::EventManager;
 #[cfg(target_arch = "aarch64")]
 use crate::arch::DeviceType;
 use crate::devices::acpi::vmgenid::{VMGenIDState, VMGenIdConstructorArgs, VmGenId, VmGenIdError};
 use crate::devices::virtio::balloon::persist::{BalloonConstructorArgs, BalloonState};
 use crate::devices::virtio::balloon::{Balloon, BalloonError};
+use crate::devices::virtio::block::BlockError;
 use crate::devices::virtio::block::device::Block;
 use crate::devices::virtio::block::persist::{BlockConstructorArgs, BlockState};
-use crate::devices::virtio::block::BlockError;
 use crate::devices::virtio::device::VirtioDevice;
 use crate::devices::virtio::mmio::MmioTransport;
+use crate::devices::virtio::net::Net;
 use crate::devices::virtio::net::persist::{
     NetConstructorArgs, NetPersistError as NetError, NetState,
 };
-use crate::devices::virtio::net::Net;
 use crate::devices::virtio::persist::{MmioTransportConstructorArgs, MmioTransportState};
+use crate::devices::virtio::rng::Entropy;
 use crate::devices::virtio::rng::persist::{
     EntropyConstructorArgs, EntropyPersistError as EntropyError, EntropyState,
 };
-use crate::devices::virtio::rng::Entropy;
 use crate::devices::virtio::vsock::persist::{
     VsockConstructorArgs, VsockState, VsockUdsConstructorArgs,
 };
 use crate::devices::virtio::vsock::{
-    Vsock, VsockError, VsockUnixBackend, VsockUnixBackendError, TYPE_VSOCK,
+    TYPE_VSOCK, Vsock, VsockError, VsockUnixBackend, VsockUnixBackendError,
 };
 use crate::devices::virtio::{TYPE_BALLOON, TYPE_BLOCK, TYPE_NET, TYPE_RNG};
 use crate::mmds::data_store::MmdsVersion;
@@ -46,7 +47,6 @@ use crate::resources::{ResourcesError, VmResources};
 use crate::snapshot::Persist;
 use crate::vmm_config::mmds::MmdsConfigError;
 use crate::vstate::memory::GuestMemoryMmap;
-use crate::EventManager;
 
 /// Errors for (de)serialization of the MMIO device manager.
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
@@ -74,6 +74,8 @@ pub enum DevicePersistError {
     MmdsConfig(#[from] MmdsConfigError),
     /// Entropy: {0}
     Entropy(#[from] EntropyError),
+    /// Pmem: {0}
+    Pmem(#[from] crate::devices::virtio::pmem::PmemError),
     /// Resource misconfiguration: {0}. Is the snapshot file corrupted?
     ResourcesError(#[from] ResourcesError),
 }
@@ -198,6 +200,17 @@ pub struct DeviceStates {
     pub mmds_version: Option<MmdsVersionState>,
     /// Entropy device state.
     pub entropy_device: Option<ConnectedEntropyState>,
+    /// Immutable pmem state, with no node-local path.
+    pub pmem_device: Option<ConnectedPmemState>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Virtio-pmem attached to a persisted MMIO transport.
+pub struct ConnectedPmemState {
+    pub device_id: String,
+    pub device_state: crate::devices::virtio::pmem::persist::PmemState,
+    pub transport_state: MmioTransportState,
+    pub device_info: MMIODeviceInfo,
 }
 
 /// A type used to extract the concrete `Arc<Mutex<T>>` for each of the device
@@ -209,6 +222,7 @@ pub enum SharedDeviceType {
     Balloon(Arc<Mutex<Balloon>>),
     Vsock(Arc<Mutex<Vsock<VsockUnixBackend>>>),
     Entropy(Arc<Mutex<Entropy>>),
+    Pmem(Arc<Mutex<crate::devices::virtio::pmem::Pmem>>),
 }
 
 pub struct MMIODevManagerConstructorArgs<'a> {
@@ -330,6 +344,18 @@ impl<'a> Persist<'a> for MMIODeviceManager {
 
             let mut locked_device = mmio_transport.locked_device();
             match locked_device.device_type() {
+                crate::devices::virtio::pmem::TYPE_PMEM => {
+                    let pmem = locked_device
+                        .as_any()
+                        .downcast_ref::<crate::devices::virtio::pmem::Pmem>()
+                        .unwrap();
+                    states.pmem_device = Some(ConnectedPmemState {
+                        device_id: devid.clone(),
+                        device_state: pmem.save(),
+                        transport_state,
+                        device_info: device_info.clone(),
+                    });
+                }
                 TYPE_BALLOON => {
                     let balloon_state = locked_device
                         .as_any()
@@ -653,6 +679,37 @@ impl<'a> Persist<'a> for MMIODeviceManager {
             )?;
         }
 
+        if let Some(pmem_state) = &state.pmem_device {
+            use crate::devices::virtio::pmem::persist::PmemConstructorArgs;
+            use crate::devices::virtio::pmem::{Pmem, PmemError};
+            let backing = constructor_args
+                .vm_resources
+                .pmem
+                .as_ref()
+                .ok_or_else(|| PmemError::Invalid("missing restore pmem binding".into()))?
+                .lock()
+                .unwrap()
+                .backing();
+            let device = Arc::new(Mutex::new(Pmem::restore(
+                PmemConstructorArgs {
+                    mem: mem.clone(),
+                    backing,
+                },
+                &pmem_state.device_state,
+            )?));
+            constructor_args
+                .vm_resources
+                .update_from_restored_device(SharedDeviceType::Pmem(device.clone()))?;
+            restore_helper(
+                device.clone(),
+                false,
+                device,
+                &pmem_state.device_id,
+                &pmem_state.transport_state,
+                &pmem_state.device_info,
+                constructor_args.event_manager,
+            )?;
+        }
         if let Some(entropy_state) = &state.entropy_device {
             let ctor_args = EntropyConstructorArgs::new(mem.clone());
 

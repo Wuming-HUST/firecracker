@@ -86,6 +86,51 @@ pub struct MicrovmState {
     pub acpi_dev_state: ACPIDeviceManagerState,
 }
 
+/// Pre-pmem state, explicitly decoded only for the immediately previous ABI.
+#[derive(Debug, Serialize, Deserialize)]
+struct LegacyDeviceStates {
+    #[cfg(target_arch = "aarch64")]
+    legacy_devices: Vec<crate::device_manager::persist::ConnectedLegacyState>,
+    block_devices: Vec<crate::device_manager::persist::ConnectedBlockState>,
+    net_devices: Vec<crate::device_manager::persist::ConnectedNetState>,
+    vsock_device: Option<crate::device_manager::persist::ConnectedVsockState>,
+    balloon_device: Option<crate::device_manager::persist::ConnectedBalloonState>,
+    mmds_version: Option<crate::device_manager::persist::MmdsVersionState>,
+    entropy_device: Option<crate::device_manager::persist::ConnectedEntropyState>,
+}
+#[derive(Debug, Serialize, Deserialize)]
+struct LegacyMicrovmState {
+    vm_info: VmInfo,
+    kvm_state: KvmState,
+    vm_state: VmState,
+    vcpu_states: Vec<VcpuState>,
+    device_states: LegacyDeviceStates,
+    acpi_dev_state: ACPIDeviceManagerState,
+}
+impl From<LegacyMicrovmState> for MicrovmState {
+    fn from(v: LegacyMicrovmState) -> Self {
+        let d = v.device_states;
+        Self {
+            vm_info: v.vm_info,
+            kvm_state: v.kvm_state,
+            vm_state: v.vm_state,
+            vcpu_states: v.vcpu_states,
+            acpi_dev_state: v.acpi_dev_state,
+            device_states: DeviceStates {
+                #[cfg(target_arch = "aarch64")]
+                legacy_devices: d.legacy_devices,
+                block_devices: d.block_devices,
+                net_devices: d.net_devices,
+                vsock_device: d.vsock_device,
+                balloon_device: d.balloon_device,
+                mmds_version: d.mmds_version,
+                entropy_device: d.entropy_device,
+                pmem_device: None,
+            },
+        }
+    }
+}
+
 /// This describes the mapping between Firecracker base virtual address and
 /// offset in the buffer or file backend for a guest memory region. It is used
 /// to tell an external process/thread where to populate the guest memory data
@@ -153,10 +198,10 @@ pub enum CreateSnapshotError {
 
 /// ARM v7 adds full UART state; v6 snapshots cannot represent pending TX IRQs.
 #[cfg(target_arch = "aarch64")]
-pub const SNAPSHOT_VERSION: Version = Version::new(7, 0, 0);
+pub const SNAPSHOT_VERSION: Version = Version::new(8, 0, 0);
 /// x86 snapshot layout is unchanged.
 #[cfg(target_arch = "x86_64")]
-pub const SNAPSHOT_VERSION: Version = Version::new(6, 0, 0);
+pub const SNAPSHOT_VERSION: Version = Version::new(7, 0, 0);
 
 /// Creates a Microvm snapshot.
 pub fn create_snapshot(
@@ -329,6 +374,8 @@ pub fn snapshot_state_sanity_check(
 /// Error type for [`restore_from_snapshot`].
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
 pub enum RestoreFromSnapshotError {
+    /// Immutable pmem backing could not be verified: {0}
+    Pmem(#[from] crate::devices::virtio::pmem::PmemError),
     /// Failed to get snapshot state from file: {0}
     File(#[from] SnapshotStateFromFileError),
     /// Invalid snapshot state: {0}
@@ -370,6 +417,18 @@ pub fn restore_from_snapshot(
         } else {
             return Err(SnapshotStateFromFileError::UnknownNetworkDevice.into());
         }
+    }
+    match (
+        &microvm_state.device_states.pmem_device,
+        &params.pmem_override,
+    ) {
+        (Some(state), Some(binding)) if state.device_state.layout == binding.layout() => {
+            vm_resources
+                .set_pmem_device(binding.clone())
+                .map_err(RestoreFromSnapshotError::Pmem)?;
+        }
+        (None, None) => {}
+        _ => return Err(SnapshotStateFromFileError::InvalidPmemBinding.into()),
     }
     let track_dirty_pages = params.enable_diff_snapshots;
 
@@ -436,6 +495,8 @@ pub fn restore_from_snapshot(
 /// Error type for [`snapshot_state_from_file`]
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
 pub enum SnapshotStateFromFileError {
+    /// Missing, unexpected or mismatched immutable pmem binding
+    InvalidPmemBinding,
     /// Failed to open snapshot file: {0}
     Open(std::io::Error),
     /// Failed to read snapshot file metadata: {0}
@@ -449,14 +510,30 @@ pub enum SnapshotStateFromFileError {
 fn snapshot_state_from_file(
     snapshot_path: &Path,
 ) -> Result<MicrovmState, SnapshotStateFromFileError> {
-    let snapshot = Snapshot::new(SNAPSHOT_VERSION);
+    use std::io::{Seek, SeekFrom};
     let mut snapshot_reader =
         File::open(snapshot_path).map_err(SnapshotStateFromFileError::Open)?;
-    let metadata = std::fs::metadata(snapshot_path).map_err(SnapshotStateFromFileError::Meta)?;
-    let snapshot_len = u64_to_usize(metadata.len());
-    let state: MicrovmState = snapshot
-        .load_with_version_check(&mut snapshot_reader, snapshot_len)
+    let len = u64_to_usize(
+        snapshot_reader
+            .metadata()
+            .map_err(SnapshotStateFromFileError::Meta)?
+            .len(),
+    );
+    let version = Snapshot::get_format_version(&mut snapshot_reader)
         .map_err(SnapshotStateFromFileError::Load)?;
+    snapshot_reader
+        .seek(SeekFrom::Start(0))
+        .map_err(SnapshotStateFromFileError::Open)?;
+    let state = if version == Version::new(SNAPSHOT_VERSION.major - 1, 0, 0) {
+        let legacy: LegacyMicrovmState = Snapshot::new(version)
+            .load_with_version_check(&mut snapshot_reader, len)
+            .map_err(SnapshotStateFromFileError::Load)?;
+        legacy.into()
+    } else {
+        Snapshot::new(SNAPSHOT_VERSION)
+            .load_with_version_check(&mut snapshot_reader, len)
+            .map_err(SnapshotStateFromFileError::Load)?
+    };
     Ok(state)
 }
 
@@ -620,6 +697,40 @@ fn send_uffd_handshake(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn test_pmem_legacy_snapshot_migration_and_crc_failure() {
+        let current = MicrovmState::default();
+        let d = current.device_states;
+        let legacy = LegacyMicrovmState {
+            vm_info: current.vm_info,
+            kvm_state: current.kvm_state,
+            vm_state: current.vm_state,
+            vcpu_states: current.vcpu_states,
+            acpi_dev_state: current.acpi_dev_state,
+            device_states: LegacyDeviceStates {
+                #[cfg(target_arch = "aarch64")]
+                legacy_devices: d.legacy_devices,
+                block_devices: d.block_devices,
+                net_devices: d.net_devices,
+                vsock_device: d.vsock_device,
+                balloon_device: d.balloon_device,
+                mmds_version: d.mmds_version,
+                entropy_device: d.entropy_device,
+            },
+        };
+        let f = TempFile::new().unwrap();
+        let version = Version::new(SNAPSHOT_VERSION.major - 1, 0, 0);
+        Snapshot::new(version)
+            .save(&mut f.as_file(), &legacy)
+            .unwrap();
+        let restored = snapshot_state_from_file(f.as_path()).unwrap();
+        assert!(restored.device_states.pmem_device.is_none());
+        assert!(restored.vcpu_states.is_empty());
+        use std::os::unix::fs::FileExt;
+        f.as_file().write_all_at(&[0xff], 0).unwrap();
+        assert!(snapshot_state_from_file(f.as_path()).is_err());
+    }
     use std::os::unix::net::UnixListener;
 
     use vmm_sys_util::tempfile::TempFile;

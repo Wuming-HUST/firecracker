@@ -74,6 +74,8 @@ pub struct LoadSnapshotParams {
     pub resume_vm: bool,
     /// The network devices to override on load.
     pub network_overrides: Vec<NetworkOverride>,
+    /// Node binding for the persisted immutable lower.
+    pub pmem_override: Option<crate::vmm_config::pmem::PmemConfig>,
 }
 
 /// Stores the configuration for loading a snapshot that is provided by the user.
@@ -99,6 +101,9 @@ pub struct LoadSnapshotConfig {
     /// The network devices to override on load.
     #[serde(default)]
     pub network_overrides: Vec<NetworkOverride>,
+    /// Explicit node binding; required for pmem snapshots, rejected for legacy.
+    #[serde(default)]
+    pub pmem_override: Option<crate::vmm_config::pmem::PmemConfig>,
 }
 
 /// Stores the configuration used for managing snapshot memory.

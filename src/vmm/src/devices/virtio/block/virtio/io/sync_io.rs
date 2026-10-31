@@ -4,7 +4,7 @@
 use std::fs::File;
 use std::io::{Seek, SeekFrom, Write};
 
-use vm_memory::{GuestMemoryError, ReadVolatile, WriteVolatile};
+use vm_memory::{GuestMemoryError, ReadVolatile};
 
 use crate::vstate::memory::{GuestAddress, GuestMemory, GuestMemoryMmap};
 
@@ -69,8 +69,8 @@ impl SyncFileEngine {
         self.file
             .seek(SeekFrom::Start(offset))
             .map_err(SyncIoError::Seek)?;
-        mem.get_slice(addr, count as usize)
-            .and_then(|slice| Ok(self.file.write_all_volatile(&slice)?))
+        mem.get_read_slice(addr, count as usize)
+            .and_then(|slice| slice.write_to(&mut self.file))
             .map_err(SyncIoError::Transfer)?;
         Ok(count)
     }

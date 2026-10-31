@@ -61,6 +61,8 @@ pub enum ResourcesError {
     VsockDevice(#[from] VsockConfigError),
     /// Entropy device error: {0}
     EntropyDevice(#[from] EntropyDeviceError),
+    /// Pmem device error: {0}
+    Pmem(#[from] crate::devices::virtio::pmem::PmemError),
 }
 
 /// Used for configuring a vmm from one single json passed to the Firecracker process.
@@ -79,6 +81,8 @@ pub struct VmmConfig {
     network_interfaces: Vec<NetworkInterfaceConfig>,
     vsock: Option<VsockDeviceConfig>,
     entropy: Option<EntropyDeviceConfig>,
+    #[serde(default)]
+    pmem: Option<crate::vmm_config::pmem::PmemConfig>,
 }
 
 /// A data structure that encapsulates the device configurations
@@ -99,6 +103,8 @@ pub struct VmResources {
     pub net_builder: NetBuilder,
     /// The entropy device builder.
     pub entropy: EntropyDeviceBuilder,
+    /// Optional immutable pmem window, never part of allocator RAM.
+    pub pmem: Option<Arc<Mutex<crate::devices::virtio::pmem::Pmem>>>,
     /// The optional Mmds data store.
     // This is initialised on demand (if ever used), so that we don't allocate it unless it's
     // actually used.
@@ -177,7 +183,21 @@ impl VmResources {
             resources.build_entropy_device(entropy_device_config)?;
         }
 
+        if let Some(config) = vmm_config.pmem {
+            resources.set_pmem_device(config)?;
+        }
         Ok(resources)
+    }
+
+    /// Configure and verify the immutable pmem backing before start or restore.
+    pub fn set_pmem_device(
+        &mut self,
+        config: crate::vmm_config::pmem::PmemConfig,
+    ) -> Result<(), crate::devices::virtio::pmem::PmemError> {
+        self.pmem = Some(Arc::new(Mutex::new(
+            crate::devices::virtio::pmem::Pmem::new(config)?,
+        )));
+        Ok(())
     }
 
     /// If not initialised, create the mmds data store with the default config.
@@ -219,6 +239,9 @@ impl VmResources {
 
             SharedDeviceType::Vsock(vsock) => {
                 self.vsock.set_device(vsock);
+            }
+            SharedDeviceType::Pmem(pmem) => {
+                self.pmem = Some(pmem);
             }
             SharedDeviceType::Entropy(entropy) => {
                 self.entropy.set_device(entropy);
@@ -437,6 +460,24 @@ impl VmResources {
         Ok(())
     }
 
+    /// vhost-user currently receives RAM-only mappings and cannot safely source DAX.
+    pub(crate) fn validate_pmem_compatibility(
+        &self,
+    ) -> Result<(), crate::devices::virtio::pmem::PmemError> {
+        if self.pmem.is_some()
+            && self
+                .block
+                .devices
+                .iter()
+                .any(|b| b.lock().unwrap().is_vhost_user())
+        {
+            return Err(crate::devices::virtio::pmem::PmemError::Invalid(
+                "pmem with vhost-user is unsupported; use the in-process block engine".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Allocates guest memory in a configuration most appropriate for these [`VmResources`].
     ///
     /// If vhost-user-blk devices are in use, allocates memfd-backed shared memory, otherwise
@@ -489,6 +530,10 @@ impl From<&VmResources> for VmmConfig {
             network_interfaces: resources.net_builder.configs(),
             vsock: resources.vsock.config(),
             entropy: resources.entropy.config(),
+            pmem: resources
+                .pmem
+                .as_ref()
+                .map(|p| p.lock().unwrap().config().clone()),
         }
     }
 }
@@ -598,6 +643,7 @@ mod tests {
             boot_timer: false,
             mmds_size_limit: HTTP_MAX_PAYLOAD_SIZE,
             entropy: Default::default(),
+            pmem: None,
         }
     }
 

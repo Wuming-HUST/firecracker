@@ -24,8 +24,100 @@ use crate::DirtyBitmap;
 use crate::utils::{get_page_size, u64_to_usize};
 use crate::vmm_config::machine_config::HugePageConfig;
 
-/// Type of GuestMemoryMmap.
-pub type GuestMemoryMmap = vm_memory::GuestMemoryMmap<Option<AtomicBitmap>>;
+/// Ordinary RAM plus explicitly readable, immutable device windows.
+/// GuestMemory/Bytes and all mutable slices deliberately expose RAM only.
+#[derive(Clone, Debug, Default)]
+pub struct GuestMemoryMmap {
+    ram: vm_memory::GuestMemoryMmap<Option<AtomicBitmap>>,
+    readonly: Vec<Arc<GuestRegionMmap>>,
+}
+
+/// A device source capability: no write, mutable slice or mutable pointer API.
+#[derive(Debug)]
+pub struct ReadOnlyGuestSlice<'a> {
+    slice: vm_memory::VolatileSlice<'a, BS<'a, Option<AtomicBitmap>>>,
+}
+
+impl ReadOnlyGuestSlice<'_> {
+    /// Read-only source address; callers must never write through it.
+    pub fn as_ptr(&self) -> *const u8 {
+        self.slice.ptr_guard().as_ptr()
+    }
+
+    /// Copy this immutable source into an output writer.
+    pub fn write_to(&self, writer: &mut File) -> Result<(), GuestMemoryError> {
+        writer.write_all_volatile(&self.slice)?;
+        Ok(())
+    }
+}
+
+impl GuestMemoryMmap {
+    /// Construct the ordinary RAM address space.
+    pub fn from_regions(regions: Vec<GuestRegionMmap>) -> Result<Self, VmMemoryError> {
+        Ok(Self {
+            ram: vm_memory::GuestMemoryMmap::from_regions(regions)?,
+            readonly: vec![],
+        })
+    }
+
+    /// Add a RAM region while preserving device windows.
+    pub fn insert_region(&self, region: Arc<GuestRegionMmap>) -> Result<Self, VmMemoryError> {
+        Ok(Self {
+            ram: self.ram.insert_region(region)?,
+            readonly: self.readonly.clone(),
+        })
+    }
+
+    /// Called only before device maps are cloned / vCPUs are started.
+    pub(crate) fn add_readonly_region(&mut self, region: Arc<GuestRegionMmap>) {
+        self.readonly.push(region);
+    }
+
+    /// Device GPA windows excluded from ordinary RAM access.
+    pub fn readonly_ranges(&self) -> Vec<std::ops::Range<u64>> {
+        self.readonly
+            .iter()
+            .map(|r| r.start_addr().0..r.start_addr().0 + r.len())
+            .collect()
+    }
+
+    /// Acquire a bounded read-only RAM or pmem source capability.
+    pub fn get_read_slice(
+        &self,
+        addr: GuestAddress,
+        len: usize,
+    ) -> Result<ReadOnlyGuestSlice<'_>, GuestMemoryError> {
+        if self.ram.find_region(addr).is_some() {
+            return self
+                .ram
+                .get_slice(addr, len)
+                .map(|slice| ReadOnlyGuestSlice { slice });
+        }
+        for region in &self.readonly {
+            if let Some(offset) = addr.0.checked_sub(region.start_addr().0) {
+                if offset < region.len() {
+                    return region
+                        .get_slice(MemoryRegionAddress(offset), len)
+                        .map(|slice| ReadOnlyGuestSlice { slice });
+                }
+            }
+        }
+        Err(GuestMemoryError::InvalidGuestAddress(addr))
+    }
+}
+
+impl GuestMemory for GuestMemoryMmap {
+    type R = GuestRegionMmap;
+    fn num_regions(&self) -> usize {
+        self.ram.num_regions()
+    }
+    fn find_region(&self, addr: GuestAddress) -> Option<&Self::R> {
+        self.ram.find_region(addr)
+    }
+    fn iter(&self) -> impl Iterator<Item = &Self::R> {
+        self.ram.iter()
+    }
+}
 /// Type of GuestRegionMmap.
 pub type GuestRegionMmap = vm_memory::GuestRegionMmap<Option<AtomicBitmap>>;
 /// Type of GuestMmapRegion.

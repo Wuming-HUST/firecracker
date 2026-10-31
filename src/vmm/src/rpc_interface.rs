@@ -111,6 +111,8 @@ pub enum VmmAction {
     /// Set the entropy device using `EntropyDeviceConfig` as input. This action can only be called
     /// before the microVM has booted.
     SetEntropyDevice(EntropyDeviceConfig),
+    /// Configure immutable pmem before cold boot.
+    SetPmemDevice(crate::vmm_config::pmem::PmemConfig),
     /// Launch the microVM. This action can only be called before the microVM has booted.
     StartMicroVm,
     /// Send CTRL+ALT+DEL to the microVM, using the i8042 keyboard function. If an AT-keyboard
@@ -146,6 +148,8 @@ pub enum VmmActionError {
     DriveConfig(#[from] DriveError),
     /// Entropy device error: {0}
     EntropyDevice(#[from] EntropyDeviceError),
+    /// Pmem device error: {0}
+    Pmem(#[from] crate::devices::virtio::pmem::PmemError),
     /// Internal VMM error: {0}
     InternalVmm(#[from] VmmError),
     /// Load snapshot error: {0}
@@ -455,6 +459,11 @@ impl<'a> PrebootApiController<'a> {
             StartMicroVm => self.start_microvm(),
             UpdateMachineConfiguration(config) => self.update_machine_config(config),
             SetEntropyDevice(config) => self.set_entropy_device(config),
+            SetPmemDevice(config) => {
+                self.boot_path = true;
+                self.vm_resources.set_pmem_device(config)?;
+                Ok(VmmData::Empty)
+            }
             // Operations not allowed pre-boot.
             CreateSnapshot(_)
             | FlushMetrics
@@ -729,6 +738,7 @@ impl RuntimeApiController {
             | SetVsockDevice(_)
             | SetMmdsConfiguration(_)
             | SetEntropyDevice(_)
+            | SetPmemDevice(_)
             | StartMicroVm
             | UpdateMachineConfiguration(_) => Err(VmmActionError::OperationNotSupportedPostBoot),
         }
@@ -1334,6 +1344,7 @@ mod tests {
         )));
         check_unsupported(runtime_request(VmmAction::LoadSnapshot(
             LoadSnapshotParams {
+                pmem_override: None,
                 snapshot_path: PathBuf::new(),
                 mem_backend: MemBackendConfig {
                     backend_type: MemBackendType::File,

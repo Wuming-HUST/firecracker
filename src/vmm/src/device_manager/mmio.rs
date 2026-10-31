@@ -11,12 +11,12 @@ use std::num::NonZeroU32;
 use std::sync::{Arc, Mutex};
 
 #[cfg(target_arch = "x86_64")]
-use acpi_tables::{aml, Aml};
+use acpi_tables::{Aml, aml};
 use kvm_ioctls::{IoEventAddress, VmFd};
 use linux_loader::cmdline as kernel_cmdline;
 #[cfg(target_arch = "x86_64")]
 use log::debug;
-use log::info;
+use log::{error, info};
 use serde::{Deserialize, Serialize};
 use vm_allocator::AllocPolicy;
 
@@ -24,6 +24,7 @@ use super::persist::DevicePersistError;
 use super::resources::ResourceAllocator;
 use crate::arch::DeviceType;
 use crate::arch::DeviceType::Virtio;
+use crate::devices::BusDevice;
 #[cfg(target_arch = "aarch64")]
 use crate::devices::legacy::RTCDevice;
 use crate::devices::pseudo::BootTimer;
@@ -33,9 +34,8 @@ use crate::devices::virtio::device::VirtioDevice;
 use crate::devices::virtio::mmio::MmioTransport;
 use crate::devices::virtio::net::Net;
 use crate::devices::virtio::rng::Entropy;
-use crate::devices::virtio::vsock::{Vsock, VsockUnixBackend, TYPE_VSOCK};
+use crate::devices::virtio::vsock::{TYPE_VSOCK, Vsock, VsockUnixBackend};
 use crate::devices::virtio::{TYPE_BALLOON, TYPE_BLOCK, TYPE_NET, TYPE_RNG};
-use crate::devices::BusDevice;
 #[cfg(target_arch = "x86_64")]
 use crate::vstate::memory::GuestAddress;
 
@@ -470,6 +470,13 @@ impl MMIODeviceManager {
         let _: Result<(), MmioError> = self.for_each_virtio_device(|kind, _, _, dev| {
             let mut device = dev.lock().expect("Poisoned lock");
             match kind {
+                crate::devices::virtio::pmem::TYPE_PMEM => {
+                    device
+                        .as_mut_any()
+                        .downcast_mut::<crate::devices::virtio::pmem::Pmem>()
+                        .unwrap()
+                        .external_snapshot_frozen = frozen;
+                }
                 TYPE_NET => {
                     device
                         .as_mut_any()
@@ -516,7 +523,12 @@ impl MMIODeviceManager {
     pub fn prepare_save_devices(&self) -> Result<(), DevicePersistError> {
         self.for_each_virtio_device(|_, _, _, dev| {
             let mut device = dev.lock().expect("Poisoned lock");
-            if let Some(block) = device.as_mut_any().downcast_mut::<Block>() {
+            if let Some(pmem) = device
+                .as_mut_any()
+                .downcast_mut::<crate::devices::virtio::pmem::Pmem>()
+            {
+                pmem.prepare_save()?;
+            } else if let Some(block) = device.as_mut_any().downcast_mut::<Block>() {
                 if !block.is_vhost_user() {
                     block.prepare_save().map_err(DevicePersistError::Block)?;
                 }
@@ -540,6 +552,16 @@ impl MMIODeviceManager {
             self.for_each_virtio_device(|virtio_type, id, _info, dev| {
                 let mut virtio = dev.lock().expect("Poisoned lock");
                 match virtio_type {
+                    crate::devices::virtio::pmem::TYPE_PMEM => {
+                        if let Err(e) = virtio
+                            .as_mut_any()
+                            .downcast_mut::<crate::devices::virtio::pmem::Pmem>()
+                            .unwrap()
+                            .process_virtio_queues()
+                        {
+                            error!("pmem kick: {e}");
+                        }
+                    }
                     TYPE_BALLOON => {
                         let balloon = virtio.as_mut_any().downcast_mut::<Balloon>().unwrap();
                         // If device is activated, kick the balloon queue(s) to make up for any
@@ -614,13 +636,13 @@ mod tests {
     use vmm_sys_util::eventfd::EventFd;
 
     use super::*;
+    use crate::Vm;
+    use crate::devices::virtio::ActivateError;
     use crate::devices::virtio::device::{IrqTrigger, VirtioDevice};
     use crate::devices::virtio::queue::Queue;
-    use crate::devices::virtio::ActivateError;
     use crate::test_utils::multi_region_mem_raw;
     use crate::vstate::kvm::Kvm;
     use crate::vstate::memory::{GuestAddress, GuestMemoryMmap};
-    use crate::Vm;
 
     const QUEUE_SIZES: &[u16] = &[64];
 
@@ -849,9 +871,11 @@ mod tests {
                 &id,
             )
             .unwrap();
-        assert!(device_manager
-            .get_device(DeviceType::Virtio(type_id), &id)
-            .is_some());
+        assert!(
+            device_manager
+                .get_device(DeviceType::Virtio(type_id), &id)
+                .is_some()
+        );
         assert_eq!(
             addr,
             device_manager.id_to_dev_info[&(DeviceType::Virtio(type_id), id.clone())].addr
@@ -865,9 +889,11 @@ mod tests {
         );
 
         let id = "bar";
-        assert!(device_manager
-            .get_device(DeviceType::Virtio(type_id), id)
-            .is_none());
+        assert!(
+            device_manager
+                .get_device(DeviceType::Virtio(type_id), id)
+                .is_none()
+        );
 
         let dummy2 = Arc::new(Mutex::new(DummyDevice::new()));
         let id2 = String::from("foo2");

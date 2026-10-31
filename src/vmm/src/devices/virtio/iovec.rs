@@ -71,9 +71,9 @@ impl IoVecBuffer {
             // range of the descriptor chain checked, i.e. [addr, addr + len) is a valid memory
             // region in the GuestMemoryMmap.
             let iov_base = mem
-                .get_slice(desc.addr, desc.len as usize)?
-                .ptr_guard_mut()
+                .get_read_slice(desc.addr, desc.len as usize)?
                 .as_ptr()
+                .cast_mut()
                 .cast::<c_void>();
             self.vecs.push(iovec {
                 iov_base,

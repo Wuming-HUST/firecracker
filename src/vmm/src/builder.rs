@@ -65,6 +65,8 @@ use crate::{EventManager, Vmm, VmmError, device_manager};
 /// Errors associated with starting the instance.
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
 pub enum StartMicrovmError {
+    /// Incompatible or invalid immutable pmem device: {0}
+    Pmem(crate::devices::virtio::pmem::PmemError),
     /// Unable to attach block device to Vmm: {0}
     AttachBlockDevice(io::Error),
     /// Unable to attach the VMGenID device: {0}
@@ -239,6 +241,15 @@ pub fn build_microvm_for_boot(
         .register_memory_regions(guest_memory)
         .map_err(VmmError::Vm)?;
 
+    vm_resources
+        .validate_pmem_compatibility()
+        .map_err(StartMicrovmError::Pmem)?;
+    if let Some(pmem) = &vm_resources.pmem {
+        vmm.vm
+            .register_readonly_memory_region(pmem.lock().unwrap().region())
+            .map_err(VmmError::Vm)
+            .map_err(StartMicrovmError::Internal)?;
+    }
     let entry_point = load_kernel(&boot_config.kernel_file, vmm.vm.guest_memory())?;
     let initrd = InitrdConfig::from_config(boot_config, vmm.vm.guest_memory())?;
 
@@ -282,6 +293,17 @@ pub fn build_microvm_for_boot(
         attach_unixsock_vsock_device(&mut vmm, &mut boot_cmdline, unix_vsock, event_manager)?;
     }
 
+    if let Some(pmem) = &vm_resources.pmem {
+        let id = pmem.lock().unwrap().config().pmem_id.clone();
+        attach_virtio_device(
+            event_manager,
+            &mut vmm,
+            id,
+            pmem.clone(),
+            &mut boot_cmdline,
+            false,
+        )?;
+    }
     if let Some(entropy) = vm_resources.entropy.get() {
         attach_entropy_device(&mut vmm, &mut boot_cmdline, entropy, event_manager)?;
     }
@@ -435,6 +457,12 @@ pub fn build_microvm_from_snapshot(
         .register_memory_regions(guest_memory)
         .map_err(VmmError::Vm)
         .map_err(StartMicrovmError::Internal)?;
+    if let Some(pmem) = &vm_resources.pmem {
+        vmm.vm
+            .register_readonly_memory_region(pmem.lock().unwrap().region())
+            .map_err(VmmError::Vm)
+            .map_err(StartMicrovmError::Internal)?;
+    }
     vmm.uffd = uffd;
 
     #[cfg(target_arch = "x86_64")]
@@ -487,6 +515,9 @@ pub fn build_microvm_from_snapshot(
     vmm.mmio_device_manager =
         MMIODeviceManager::restore(mmio_ctor_args, &microvm_state.device_states)
             .map_err(MicrovmStateError::RestoreDevices)?;
+    vm_resources
+        .validate_pmem_compatibility()
+        .map_err(StartMicrovmError::Pmem)?;
     // ARM restores full UART state, including THRE interrupts. The legacy
     // RDA-only workaround would overwrite its saved interrupt-enable register.
     #[cfg(target_arch = "x86_64")]

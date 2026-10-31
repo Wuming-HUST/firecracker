@@ -257,6 +257,7 @@ fn verify_load_snapshot(snapshot_file: TempFile, memory_file: TempFile) {
 
     preboot_api_controller
         .handle_preboot_request(VmmAction::LoadSnapshot(LoadSnapshotParams {
+            pmem_override: None,
             snapshot_path: snapshot_file.as_path().to_path_buf(),
             mem_backend: MemBackendConfig {
                 backend_path: memory_file.as_path().to_path_buf(),
@@ -341,6 +342,7 @@ fn verify_load_snap_disallowed_after_boot_resources(res: VmmAction, res_name: &s
 
     // Load snapshot should no longer be allowed.
     let req = VmmAction::LoadSnapshot(LoadSnapshotParams {
+        pmem_override: None,
         snapshot_path: snapshot_file.as_path().to_path_buf(),
         mem_backend: MemBackendConfig {
             backend_path: memory_file.as_path().to_path_buf(),

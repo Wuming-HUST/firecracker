@@ -161,8 +161,8 @@ impl AsyncFileEngine {
         count: u32,
         req: PendingRequest,
     ) -> Result<(), RequestError<AsyncIoError>> {
-        let buf = match mem.get_slice(addr, count as usize) {
-            Ok(slice) => slice.ptr_guard_mut().as_ptr(),
+        let buf = match mem.get_read_slice(addr, count as usize) {
+            Ok(slice) => slice.as_ptr(),
             Err(err) => {
                 return Err(RequestError {
                     req,
